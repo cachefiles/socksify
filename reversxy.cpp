@@ -13,7 +13,9 @@
 #include "txall.h"
 
 #ifndef WIN32
+#include <unistd.h>
 #define closesocket(s) close(s)
+#define SD_BOTH SHUT_RDWR
 #endif
 
 #define STDIN_FILE_FD 0
@@ -34,7 +36,94 @@ struct relay_data {
 #define RDF_FIN 0x02
     int flag;
     char buf[4096];
+
+	tx_task_t rtask;
+	tx_task_t wtask;
 };
+
+int fill_relay_data(struct relay_data *d, tx_aiocb *f)
+{
+	int len;
+	int change = 0;
+
+	if (d->off >= d->len) d->off = d->len = 0;
+
+	if (tx_readable(f) &&
+			d->len < (int)sizeof(d->buf) && !d->flag) {
+		len = recv(f->tx_fd, d->buf + d->len, sizeof(d->buf) - d->len, 0);
+		tx_aincb_update(f, len);
+
+	fprintf(stderr, "len: %d\n", len);
+		change |= (len > 0);
+		if (len > 0)
+			d->len += len;
+		else if (len == 0)
+			d->flag |= RDF_EOF;
+		else if (tx_readable(f)) // socket meet error condiction
+			return 0x2;
+	}
+
+	return change;
+}
+
+int write_relay_data(struct relay_data *d, tx_aiocb *f)
+{
+	int len;
+	int change = 0;
+
+	if (tx_writable(f) && d->off < d->len) {
+		do {
+			len = tx_outcb_write(f, d->buf + d->off, d->len - d->off);
+			if (len > 0) {
+				change |= (len > 0);
+				d->off += len;
+			} else if (tx_writable(f)) {
+				return 0x2;
+			}
+		} while (len > 0 && d->off < d->len);
+	}
+
+	return change;
+}
+
+int try_shutdown_relay(struct relay_data *d, tx_aiocb *f)
+{
+	if (d->off >= d->len) {
+		d->off = d->len = 0;
+
+		if (d->flag == RDF_EOF && tx_writable(f)) {
+			shutdown(f->tx_fd, SD_BOTH);
+			d->flag |= RDF_FIN;
+		}
+	}
+
+	return 0;
+}
+
+int relay_fill_prepare(struct relay_data *d, tx_aiocb *f)
+{
+	int error = 0;
+
+	if ((d->flag == 0) && !tx_readable(f) &&
+			d->len < (int)sizeof(d->buf)) {
+		tx_aincb_active(f, &d->rtask);
+		error = 1;
+	}
+
+	return error;
+}
+
+int relay_write_prepare(struct relay_data *d, tx_aiocb *f)
+{
+	int error = 0;
+
+	if ((d->off < d->len || d->flag == RDF_EOF) && !tx_writable(f)) {
+		tx_outcb_prepare(f, &d->wtask, 0);
+		error = 1;
+	}
+
+	return error;
+}
 
 struct channel_context {
 	int flags;
@@ -70,12 +159,44 @@ static void do_channel_release(struct channel_context *up)
 	fd = cb->tx_fd;
 	tx_aiocb_fini(cb);
 	closesocket(fd);
+
+	tx_task_drop(&up->c2r.rtask);
+	tx_task_drop(&up->c2r.wtask);
+	tx_task_drop(&up->r2c.rtask);
+	tx_task_drop(&up->r2c.wtask);
+
 	delete up;
 }
 
 static int do_channel_poll(struct channel_context *up)
 {
-	return -1;
+	int error = 0;
+	int change = 0;
+
+	do {
+		change = fill_relay_data(&up->c2r, &up->file);
+		if (change & 0x02) return 0;
+		change |= write_relay_data(&up->c2r, &up->remote);
+		if (change & 0x02) return 0;
+	} while (change);
+
+	do {
+		change = fill_relay_data(&up->r2c, &up->remote);
+		if (change & 0x02) return 0;
+		change |= write_relay_data(&up->r2c, &up->file);
+		if (change & 0x02) return 0;
+	} while (change);
+
+	try_shutdown_relay(&up->c2r, &up->remote);
+	try_shutdown_relay(&up->r2c, &up->file);
+
+	error  = relay_fill_prepare(&up->c2r, &up->file);
+	error |= relay_fill_prepare(&up->r2c, &up->remote);
+
+	error |= relay_write_prepare(&up->c2r, &up->remote);
+	error |= relay_write_prepare(&up->r2c, &up->file);
+
+	return error;
 }
 
 static void do_channel_wrapper(void *up)
@@ -86,7 +207,8 @@ static void do_channel_wrapper(void *up)
 	upp = (struct channel_context *)up;
 	err = do_channel_poll(upp);
 
-	if (err != 0) {
+	if (err == 0) {
+		fprintf(stderr, "channel release\n");
 		do_channel_release(upp);
 		return;
 	}
@@ -103,7 +225,10 @@ static void do_channel_prepare(struct channel_context *up, int newfd, unsigned s
 
 	tx_aiocb_init(&up->file, loop, newfd);
 	tx_task_init(&up->task, loop, do_channel_wrapper, up);
-	tx_task_active(&up->task);
+	tx_task_init(&up->c2r.rtask, loop, do_channel_wrapper, up);
+	tx_task_init(&up->c2r.wtask, loop, do_channel_wrapper, up);
+	tx_task_init(&up->r2c.rtask, loop, do_channel_wrapper, up);
+	tx_task_init(&up->r2c.wtask, loop, do_channel_wrapper, up);
 
 	up->port = port;
 	up->domain[0] = 0;
@@ -118,26 +243,16 @@ static void do_channel_prepare(struct channel_context *up, int newfd, unsigned s
 	tx_setblockopt(peerfd, 0);
 	tx_aiocb_init(&up->remote, loop, peerfd);
 
-#if 0
 	sin0.sin_family = AF_INET;
-	sin0.sin_port   = g_target.port;
-	sin0.sin_addr.s_addr = g_target.address;
+	sin0.sin_port   = htons(80);
+	sin0.sin_addr.s_addr = inet_addr("103.235.46.39");
 	tx_aiocb_connect(&up->remote, (struct sockaddr *)&sin0, sizeof(sin0), &up->task);
-#endif
 
+	up->flags = 0;
+	up->c2r.flag = 0;
 	up->c2r.len = up->c2r.off = 0;
+	up->r2c.flag = 0;
 	up->r2c.len = up->r2c.off = 0;
-
-	up->pxy_stat = 0;
-	up->proxy_handshake = NULL;
-#if 0
-	up->flags = (FLAG_UPLOAD| FLAG_DOWNLOAD| FLAG_CONNECTING);
-
-	if (_g_proxy_handshake != NULL) {
-		up->proxy_handshake = _g_proxy_handshake;
-		up->flags |= FLAG_HANDSHAKE;
-	}
-#endif
 
 	fprintf(stderr, "newfd: %d to here\n", newfd);
 	return;
