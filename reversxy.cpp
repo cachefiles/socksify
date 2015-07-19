@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <string.h>
 #include <stdlib.h>
+#include <regex.h>
 #ifdef WIN32
 #include <windows.h>
 #else
@@ -11,6 +12,7 @@
 #endif
 
 #include "txall.h"
+#include "buf_checker.h"
 
 #ifndef WIN32
 #include <unistd.h>
@@ -53,7 +55,6 @@ int fill_relay_data(struct relay_data *d, tx_aiocb *f)
 		len = recv(f->tx_fd, d->buf + d->len, sizeof(d->buf) - d->len, 0);
 		tx_aincb_update(f, len);
 
-	fprintf(stderr, "len: %d\n", len);
 		change |= (len > 0);
 		if (len > 0)
 			d->len += len;
@@ -125,6 +126,102 @@ int relay_write_prepare(struct relay_data *d, tx_aiocb *f)
 	return error;
 }
 
+enum {
+    NONE_PROTO = 0,
+    UNKOWN_PROTO = (1 << 0),
+    SOCKV4_PROTO = (1 << 1),
+    SOCKV5_PROTO = (1 << 2),
+
+    HTTP_PROTO = (1 << 3),
+	HTTPS_PROTO = (1 << 4),
+
+    START_PROTO = (1 << 5),
+	DIRECT_PROTO = (1 << 6),
+};
+
+static const int SUPPORTED_PROTO = UNKOWN_PROTO| SOCKV4_PROTO| SOCKV5_PROTO| HTTP_PROTO| HTTPS_PROTO| DIRECT_PROTO ;
+
+static int check_proxy_proto(struct relay_data *d)
+{
+	int flags = 0;
+	struct buf_match m;
+
+	buf_init(&m, d->buf, d->len);
+	if (buf_equal(&m, 0, 0x04) && buf_find(&m, 8, 0)) {
+		flags |= SOCKV4_PROTO;
+		return flags;
+	}
+
+	if (buf_equal(&m, 0, 0x05) && buf_valid(&m, 1)) {
+		int len = (m.base[1] & 0xFF);
+		if (memchr(&m.base[2], 0x0, len)) {
+			flags |= SOCKV5_PROTO;
+			return flags;
+		}
+
+		if (memchr(&m.base[2], 0x2, len)) {
+			flags |= SOCKV5_PROTO;
+			return flags;
+		}
+	}
+
+	if (buf_equal(&m, 0, 'C')) {
+		int off = 0;
+		const char *op = "CONNECT ";
+		while (*++op != 0) {
+			if (!buf_equal(&m, ++off, *op))
+				break;
+		}
+		if (*op == 0) {
+			flags |= HTTPS_PROTO;
+			return flags;
+		}
+	}
+
+	if (buf_equal(&m, 0, 'G')) {
+		int off = 0;
+		const char *op = "GET ";
+		while (*++op != 0) {
+			if (!buf_equal(&m, ++off, *op))
+				break;
+		}
+		if (*op == 0) {
+			flags |= HTTP_PROTO;
+			return flags;
+		}
+	}
+
+	if (buf_equal(&m, 0, 'P')) {
+		int off = 0;
+		const char *op = "POST ";
+		while (*++op != 0) {
+			if (!buf_equal(&m, ++off, *op))
+				break;
+		}
+		if (*op == 0) {
+			flags |= HTTP_PROTO;
+			return flags;
+		}
+	}
+
+	if (!buf_overflow(&m)) {
+		flags |= UNKOWN_PROTO;
+		return flags;
+	}
+
+	if (d->len == sizeof(d->buf)) {
+		flags |= UNKOWN_PROTO;
+		return flags;
+	}
+
+	if (d->flag & RDF_EOF) {
+		flags |= UNKOWN_PROTO;
+		return flags;
+	}
+
+	return 0;
+}
+
 struct channel_context {
 	int flags;
 	int pxy_stat;
@@ -168,10 +265,401 @@ static void do_channel_release(struct channel_context *up)
 	delete up;
 }
 
+static int parse_https_target(struct relay_data *d, char *host)
+{
+	char buf[128];
+	sscanf(d->buf, "CONNECT %s", buf);
+	fprintf(stderr, "https target %s\n", buf);
+
+	const char *_https_map[] = {
+		"openapi.youku.com",
+		"61.135.196.99",
+		"220.181.185.150",
+		"111.13.127.46",
+		"211.151.50.10",
+		"123.126.99.57",
+		"123.126.99.39",
+		"220.181.154.137",
+		"httpbin.org",
+		NULL
+	};
+
+	for (int i = 0; _https_map[i]; i++) {
+		if (strcmp(_https_map[i], buf) == 0) {
+			strcpy(host, "@");
+			strcat(host, buf);
+			return 0;
+		}
+	}
+
+	strcpy(host, buf);
+	return 0;
+}
+
+#define N 10
+static int is_ipcheck_url(const char *host, const char *fulluri, const char *regex)
+{
+	int insub;
+	regex_t reg;
+	regmatch_t pm[N];
+
+	const char *di;
+	char *sp, sub_regex[512];
+
+	sp = sub_regex;
+	insub = 0;
+
+	di = strchr(fulluri, '/');
+	if (di != NULL) fulluri = di;
+	fprintf(stderr, "full regex is: %s V%s V%s\n", host, fulluri, regex);
+
+	for (const char *p = regex; *p; p++) {
+		if (insub == 0 && *p != '/') {
+			printf("ignore char %c\n", *p);
+			continue;
+		}
+
+		if (insub == 0 && *p == '/') {
+			insub = 1;
+			continue;
+		}
+
+		if (*p == '\\' && *p != 0) {
+			*sp++ = *p++;
+			*sp++ = *p;
+			continue;
+		}
+
+		if (*p != ',') {
+			*sp++ = *p;
+			continue;
+		}
+
+		*sp = 0;
+		if (sp > (sub_regex + 2) &&
+				*(sp - 1) == 'i' && *(sp - 2) == '/') {
+			*(sp - 2) = 0;
+		}
+
+		fprintf(stderr, "regex is: %s\n", sub_regex);
+		int z = REG_NOMATCH;
+		int error = regcomp(&reg, sub_regex + 1, REG_EXTENDED|REG_NOSUB|REG_NOTEOL);
+		if (0 == error) {
+			z = regexec(&reg, fulluri, N, pm, REG_NOTBOL);
+			regfree(&reg);
+		} else {
+			fprintf(stderr, "regex %d failure: %s\n", error, sub_regex);
+		}
+
+		if (z != REG_NOMATCH) {
+			fprintf(stderr, "regex match: %d\n", z);
+			return 1;
+		}
+
+		printf("not match\n");
+		sp = sub_regex;
+		insub = 0;
+	}
+
+	if (insub) {
+		*sp = 0;
+		if (sp > (sub_regex + 2) &&
+				*(sp - 1) == 'i' && *(sp - 2) == '/') {
+			*(sp - 2) = 0;
+		}
+
+		fprintf(stderr, "regex is: %s\n", sub_regex);
+		int z = REG_NOMATCH;
+		int error = regcomp(&reg, sub_regex + 1, REG_EXTENDED|REG_NOSUB|REG_NOTEOL|REG_NOTBOL);
+		if (0 == error) {
+			z = regexec(&reg, fulluri, N, pm, REG_NOTBOL);
+			regfree(&reg);
+		} else {
+			fprintf(stderr, "regex %d failure: %s\n", error, sub_regex);
+		}
+
+		if (z != REG_NOMATCH) {
+			fprintf(stderr, "regex match: %d\n", z);
+			return 1;
+		}
+
+		printf("not match\n");
+		sp = sub_regex;
+		insub = 0;
+	}
+
+	return 0;
+}
+
+static int parse_http_target(struct relay_data *d, char *host)
+{
+	char *p, *delter;
+	char buf[512], method[16];
+	sscanf(d->buf, "%s %s", method, buf);
+
+	if (memcmp(buf, "http://", 7) &&
+			memcmp(buf, "https://", 8) &&
+			memmem(d->buf, d->len, "\n\n", 2) == NULL &&
+			memmem(d->buf, d->len, "\r\n\r\n", 4) == NULL) {
+		fprintf(stderr, "request not finish: %s|## %d\n", buf, d->len);
+		return 1;
+	}
+
+	delter = (buf + 7);
+	if (*buf == '/' && d->len < sizeof(d->buf)) {
+		char path[512];
+		d->buf[d->len] = 0;
+		p = strcasestr(d->buf, "\nHost: ");
+		if (p != NULL) {
+			strcpy(path, buf);
+			sscanf(p + 7, "%s", buf);
+			strcat(buf, path);
+			delter = buf;
+		}
+	}
+
+	p = strchr(delter, '/');
+	if (p) {
+		memcpy(host, delter, p - delter);
+		host[p - delter] = 0;
+	} else {
+		strcpy(host, delter);
+	}
+
+	const char *any = "/^[^/]*\\.dpool\\.sina\\.com\\.cn\\/iplookup/i, /^[^/]*/vrs_flash\\.action/i";
+	const char *list[] = {
+		"v.youku.com", "/^\\/player\\//i",
+		"api.youku.com", "/^\\/player\\//i",
+		"play.youku.com", "/^\\/play\\/get\\.json/i",
+		"v2.tudou.com", "/^\\//i",
+		"www.tudou.com", "/^\\/a\\//i, /^\\/v\\//i, /^\\/outplay\\/goto\\/getTvcCode/i, /^\\/tvp\\/alist\\.action/i",
+		"s.plcloud.music.qq.com", "/^\\/fcgi\\-bin\\/p\\.fcg/i",
+		"i.y.qq.com", "/^\\/s\\.plcloud\\/fcgi\\-bin\\/p\\.fcg/i",
+		"hot.vrs.sohu.com", "/^\\//i",
+		"live.tv.sohu.com", "/^\\/live\\/player/i",
+		"pad.tv.sohu.com", "/^\\/playinfo/i",
+		"my.tv.sohu.com", "/^\\/play\\/m3u8version\\.do/i",
+		"hot.vrs.letv.com", "/^\\//i",
+		"data.video.qiyi.com", "/^\\/v\\./i,/^\\/videos\\//i,/^\\/.*\\/videos\\//i",
+		"cache.video.qiyi.com", "/^\\/vms\\?/i,/^\\/vp\\/.*\\/.*\\/\\?src=/i,/^\\/vps\\?/i",
+		"cache.vip.qiyi.com", "/^\\/vms\\?/i",
+		"v.api.hunantv.com", "/^\\/player\\/video/i",
+		"vv.video.qq.com", "/^\\//i,/^\\/getvinfo/i, /^\\/getinfo/i,/^\\/geturl/i",
+		"tt.video.qq.com", "/^\\/getvinfo/i",
+		"ice.video.qq.com", "/^\\/getvinfo/i",
+		"tjsa.video.qq.com", "/^\\/getvinfo/i",
+		"a10.video.qq.com", "/^\\/getvinfo/i",
+		"xyy.video.qq.com", "/^\\/getvinfo/i",
+		"vcq.video.qq.com", "/^\\/getvinfo/i",
+		"vsh.video.qq.com", "/^\\/getvinfo/i",
+		"vbj.video.qq.com", "/^\\/getvinfo/i",
+		"bobo.video.qq.com", "/^\\/getvinfo/i",
+		"flvs.video.qq.com", "/^\\/getvinfo/i",
+		"bkvv.video.qq.com", "/^\\/getvinfo/i",
+		"info.zb.qq.com", "/^\\/\\?/i",
+		"geo.js.kankan.xunlei.com", "/^\\//i",
+		"web-play.pptv.com", "/^\\//i",
+		"web-play.pplive.cn", "/^\\//i",
+		"dyn.ugc.pps.tv", "/^\\//i",
+		"v.pps.tv", "/^\\/ugc\\/ajax\\/aj_html5_url\\.php/i",
+		"inner.kandian.com", "/^\\//i",
+		"ipservice.163.com", "/^\\//i",
+		"so.open.163.com", "/^\\/open\\/info\\.htm/i",
+		"zb.s.qq.com", "/^\\//i",
+		"ip.kankan.xunlei.com", "/^\\//i",
+		"vxml.56.com", "/^\\/json\\//i",
+		"music.sina.com.cn", "/^\\/yueku\\/intro\\//i, /^\\/radio\\/port\\/webFeatureRadioLimitList\\.php/i",
+		"play.baidu.com", "/^\\/data\\/music\\/songlink/i",
+		"v.iask.com", "/^\\/v_play\\.php/i,/^\\/v_play_ipad\\.cx\\.php/i",
+		"tv.weibo.com", "/^\\/player\\//i",
+		"wtv.v.iask.com", "/^\\/.*\\.m3u8/i,/^\\/mcdn\\.php$/i",
+		"video.sina.com.cn", "/^\\/interface\\/l\\/u\\/getFocusStatus\\.php/i",
+		"www.yinyuetai.com", "/^\\/insite\\//i,/^\\/main\\/get\\-/i",
+		"api.letv.com", "/^\\/streamblock/i,/^\\/mms\\/out\\/video\\/play/i,/^\\/mms\\/out\\/common\\/geturl/i,/^\\/geturl/i,/^\\/api\\/geturl/i,/^\\/getipgeo$/i",
+		"st.live.letv.com", "/^\\/live\\//i",
+		"live.gslb.letv.com", "/^\\/gslb\\?/i",
+		"static.itv.letv.com", "/^\\/api/i",
+		"ip.apps.cntv.cn", "/^\\/js\\/player\\.do/i",
+		"vdn.apps.cntv.cn", "/^\\/api\\/get/i, /^\\/api\\/getLiveUrlCommonApi\\.do\\?pa:\\/\\/cctv_p2p_hdcctv5/i, /^\\/api\\/getLiveUrlCommonApi\\.do\\?pa:\\/\\/cctv_p2p_hdcctv6/i, /^\\/api\\/getLiveUrlCommonApi\\.do\\?pa:\\/\\/cctv_p2p_hdcctv8/i, /^\\/api\\/getLiveUrlCommonApi\\.do\\?pa:\\/\\/cctv_p2p_hdbtv6/i",
+		"vdn.live.cntv.cn", "/^\\/api2\\/liveHtml5\\.do\\?channel=pa:\\/\\/cctv_p2p_hdcctv5/i, /^\\/api2\\/liveHtml5\\.do\\?channel=pa:\\/\\/cctv_p2p_hdcctv6/i, /^\\/api2\\/liveHtml5\\.do\\?channel=pa:\\/\\/cctv_p2p_hdcctv8/i, /^\\/api2\\/liveHtml5\\.do\\?channel=pa:\\/\\/cctv_p2p_hdbtv6/i, /^\\/api2\\/live\\.do\\?channel=pa:\\/\\/cctv_p2p_hdcctv5/i, /^\\/api2\\/live\\.do\\?channel=pa:\\/\\/cctv_p2p_hdcctv6/i, /^\\/api2\\/live\\.do\\?channel=pa:\\/\\/cctv_p2p_hdcctv8/i, /^\\/api2\\/live\\.do\\?channel=pa:\\/\\/cctv_p2p_hdbtv6/i",
+		"vip.sports.cntv.cn", "/^\\/check\\.do/i,/^\\/play\\.do/i, /^\\/servlets\\/encryptvideopath\\.do/i",
+		"211.151.157.15", "/^\\//i",
+		"a.play.api.3g.youku.com", "/^\\/common\\/v3\\/play\\?/i",
+		"i.play.api.3g.youku.com", "/^\\/common\\/v3\\/play\\?/i,/^\\/common\\/v3\\/hasadv\\/play\\?/i",
+		"api.3g.youku.com", "/^\\/layout/i, /^\\/v3\\/play\\/address/i, /^\\/openapi\\-wireless\\/videos\\/.*\\/download/i, /^\\/videos\\/.*\\/download/i, /^\\/common\\/v3\\/play/i",
+		"statis.api.3g.youku.com", "/^\\/layout/i, /^\\/v3\\/play\\/address/i, /^\\/openapi\\-wireless\\/videos\\/.*\\/download/i, /^\\/videos\\/.*\\/download/i, /^\\/common\\/v3\\/play/i",
+		"tv.api.3g.youku.com", "/^\\/openapi\\-wireless\\/v3\\/play\\/address/i, /^\\/common\\/v3\\/hasadv\\/play/i, /^\\/common\\/v3\\/play/i",
+		"play.api.3g.youku.com", "/^\\/common\\/v3\\/hasadv\\/play/i, /^\\/common\\/v3\\/play/i,/^\\/v3\\/play\\/address/i",
+		"play.api.3g.tudou.com", "/^\\/v/i",
+		"tv.api.3g.tudou.com", "/^\\/tv\\/play\\?/i",
+		"api.3g.tudou.com", "/^\\//i",
+		"api.tv.sohu.com", "/^\\/mobile_user\\/device\\/clientconf\\.json\\?/i",
+		"access.tv.sohu.com", "/^\\//i",
+		"iface.iqiyi.com", "/^\\/api\\/searchIface\\?/i",
+		"iface2.iqiyi.com", "/^\\/php\\/xyz\\/iface\\//i,/^\\/php\\/xyz\\/entry\\/galaxy\\.php\\?/i,/^\\/php\\/xyz\\/entry\\/nebula\\.php\\?/i",
+		"cache.m.iqiyi.com", "/^\\/jp\\/tmts\\//i",
+		"dynamic.app.m.letv.com", "/^\\/.*\\/dynamic\\.php\\?.*ctl=videofile/i",
+		"dynamic.meizi.app.m.letv.com", "/^\\/.*\\/dynamic\\.php\\?.*ctl=videofile/i",
+		"dynamic.search.app.m.letv.com", "/^\\/.*\\/dynamic\\.php\\?.*ctl=videofile/i",
+		"dynamic.live.app.m.letv.com", "/^\\/.*\\/dynamic\\.php\\?.*act=canplay/i",
+		"listso.m.areainfo.ppstream.com", "/^\\/ip\\/q\\.php/i",
+		"epg.api.pptv.com", "/^\\/detail\\.api\\?/i",
+		"play.api.pptv.com", "/^\\/boxplay\\.api\\?/i",
+		"m.letv.com", "/^\\/api\\/geturl\\?/i",
+		"interface.bilibili.com", "/^\\/playurl\\?/i",
+		"3g.music.qq.com", "/^\\//i",
+		"mqqplayer.3g.qq.com", "/^\\//i",
+		"proxy.music.qq.com", "/^\\//i",
+		"proxymc.qq.com", "/^\\//i",
+		"ip2.kugou.com", "/^\\/check\\/isCn\\//i",
+		"ip.kugou.com", "/^\\/check\\/isCn\\//i",
+		"client.api.ttpod.com", "/^\\/global/i",
+		"mobi.kuwo.cn", "/^\\//i",
+		"mobilefeedback.kugou.com", "/^\\//i",
+		"tingapi.ting.baidu.com", "/^\\/v1\\/restserver\\/ting\\?.*method=baidu\\.ting\\.song/i",
+		"music.baidu.com", "/^\\/data\\/music\\/links\\?/i",
+		"serviceinfo.sdk.duomi.com", "/^\\/api\\/serviceinfo\\/getserverlist/i",
+		"music.163.com", "/^\\/api\\/copyright\\/restrict\\/\\?/i,/^\\/api\\/batch$/i",
+		"www.xiami.com", "/^\\/web\\/spark/i,/^\\/web\\/.*\\?.*xiamitoken=/i",
+		"spark.api.xiami.com", "/^\\/api\\?.*method=AuthIp/i,/^\\/api\\?.*method=Start\\.init/i,/^\\/api\\?.*method=Songs\\.getTrackDetail/i,/^\\/api\\?.*method=Songs\\.detail/i",
+		"iplocation.geo.qiyi.com", "/^\\/cityjson$/i",
+		"sns.video.qq.com", "/^\\/tunnel\\/fcgi\\-bin\\/tunnel/i",
+		"v5.pc.duomi.com", "/^\\/single\\-ajaxsingle\\-isban/i",
+		"tms.is.ysten.com", "/^:8080\\/yst\\-tms\\/login\\.action\\?/i",
+		"chrome.2345.com", "/^\\/dianhua\\/mobileApi\\/check\\.php$/i",
+		"internal.check.duokanbox.com", "/^\\/check\\.json/i",
+		"180.153.225.136", "/^\\//i",
+		"118.244.244.124", "/^\\//i",
+		"210.129.145.150", "/^\\//i",
+		"182.16.230.98", "/^\\//i"
+	};
+
+	if (is_ipcheck_url(host, delter, any)) {
+		char buf[128];
+		sprintf(buf, "@%s", host);
+		strcpy(host, buf);
+	} else {
+		for (int i = 0; i < sizeof(list)/sizeof(list[0]); i++) {
+			if (strcmp(list[i], host) == 0) {
+				if (is_ipcheck_url(host, delter, list[i + 1])) {
+					char buf[128];
+					sprintf(buf, "@%s", host);
+					strcpy(host, buf);
+				}
+				break;
+			}
+
+			i++;
+		}
+	}
+
+	fprintf(stderr, "http target %s, method %s\n", buf, method);
+	return 0;
+}
+
+static int do_host_connect(tx_aiocb *s, char *domain, int port, tx_task_t *t)
+{
+	int error = -1;
+	struct sockaddr_in sin0;
+	struct tcpip_info info = {0};
+	tx_loop_t *loop = tx_loop_default();
+
+	info.port = htons(port);
+	if (*domain == '@') domain = "proxy.uku.im:8888";
+	error = get_target_address(&info, domain);
+	if (error != 0) {
+		fprintf(stderr, "failure targethost: %s\n", domain);
+		return -1;
+	}
+
+	int peerfd = socket(AF_INET, SOCK_STREAM, 0);
+
+	tx_setblockopt(peerfd, 0);
+
+	memset(&sin0, 0, sizeof(sin0));
+	sin0.sin_family = AF_INET;
+	error = bind(peerfd, (struct sockaddr *)&sin0, sizeof(sin0));
+
+	tx_aiocb_init(s, loop, peerfd);
+
+	sin0.sin_family = AF_INET;
+	sin0.sin_port   = (info.port);
+	sin0.sin_addr.s_addr = (info.address);
+	fprintf(stderr, "connect to %s: %x:%d\n", domain, info.address, htons(info.port));
+	return tx_aiocb_connect(s, (struct sockaddr *)&sin0, sizeof(sin0), t);
+}
+
 static int do_channel_poll(struct channel_context *up)
 {
 	int error = 0;
 	int change = 0;
+
+	if (up->flags & START_PROTO) {
+		if (!tx_writable(&up->remote)) {
+			return 1;
+		}
+
+		fprintf(stderr, "connect is finish\n");
+		up->flags &= ~START_PROTO;
+	}
+
+
+	if (NONE_PROTO == (up->flags & SUPPORTED_PROTO)) {
+		change = fill_relay_data(&up->c2r, &up->file);
+		up->flags |= check_proxy_proto(&up->c2r);
+		if (NONE_PROTO == (up->flags & SUPPORTED_PROTO)) {
+			return relay_fill_prepare(&up->c2r, &up->file);
+		}
+
+		fprintf(stderr, "proto detected: %x\n", up->flags);
+	}
+
+	if (up->flags &  HTTPS_PROTO) {
+		char targethost[128];
+		change = fill_relay_data(&up->c2r, &up->file);
+		if (parse_https_target(&up->c2r, targethost)) {
+			return relay_fill_prepare(&up->c2r, &up->file);
+		}
+
+		if (do_host_connect(&up->remote, targethost, 443, &up->task) == -1) {
+			fprintf(stderr,  "xxtargethost: %s\n", targethost);
+			return 0;
+		}
+
+		char resp[] = "HTTP/1.0 200 OK\r\n\r\n";
+		strcpy(up->r2c.buf, resp);
+		up->r2c.len = strlen(resp);
+		up->c2r.len = 0;
+		up->c2r.off = 0;
+	
+		fprintf(stderr, "https targethost: %s\n", targethost);
+		up->flags |= (START_PROTO| DIRECT_PROTO);
+		up->flags &= ~HTTPS_PROTO;
+		return 1;
+	}
+
+	if (up->flags &  HTTP_PROTO) {
+		char targethost[128];
+		change = fill_relay_data(&up->c2r, &up->file);
+		if (parse_http_target(&up->c2r, targethost)) {
+			return relay_fill_prepare(&up->c2r, &up->file);
+		}
+
+		if (do_host_connect(&up->remote, targethost, 80, &up->task) == -1) {
+			fprintf(stderr,  "xxtargethost: %s\n", targethost);
+			return 0;
+		}
+	
+		fprintf(stderr, "targethost: %s\n", targethost);
+		up->flags |= (START_PROTO| DIRECT_PROTO);
+		up->flags &= ~HTTP_PROTO;
+		return 1;
+	}
+
+	if (DIRECT_PROTO != (up->flags & DIRECT_PROTO)) {
+		fprintf(stderr, "proto handle error: %x\n", up->flags);
+		return 0;
+	}
 
 	do {
 		change = fill_relay_data(&up->c2r, &up->file);
@@ -234,6 +722,7 @@ static void do_channel_prepare(struct channel_context *up, int newfd, unsigned s
 	up->domain[0] = 0;
 	tx_setblockopt(newfd, 0);
 
+#if 0
 	peerfd = socket(AF_INET, SOCK_STREAM, 0);
 
 	memset(&sa0, 0, sizeof(sa0));
@@ -247,6 +736,10 @@ static void do_channel_prepare(struct channel_context *up, int newfd, unsigned s
 	sin0.sin_port   = htons(80);
 	sin0.sin_addr.s_addr = inet_addr("103.235.46.39");
 	tx_aiocb_connect(&up->remote, (struct sockaddr *)&sin0, sizeof(sin0), &up->task);
+#else
+	tx_aiocb_init(&up->remote, loop, -1);
+	tx_task_active(&up->task);
+#endif
 
 	up->flags = 0;
 	up->c2r.flag = 0;
