@@ -297,6 +297,8 @@ static int parse_https_target(struct relay_data *d, char *host)
 }
 
 #define N 10
+#define DEBUG(msg, ...)
+
 static int is_ipcheck_url(const char *host, const char *fulluri, const char *regex)
 {
 	int insub;
@@ -311,11 +313,10 @@ static int is_ipcheck_url(const char *host, const char *fulluri, const char *reg
 
 	di = strchr(fulluri, '/');
 	if (di != NULL) fulluri = di;
-	fprintf(stderr, "full regex is: %s V%s V%s\n", host, fulluri, regex);
 
 	for (const char *p = regex; *p; p++) {
 		if (insub == 0 && *p != '/') {
-			printf("ignore char %c\n", *p);
+			DEBUG("ignore char %c\n", *p);
 			continue;
 		}
 
@@ -341,7 +342,7 @@ static int is_ipcheck_url(const char *host, const char *fulluri, const char *reg
 			*(sp - 2) = 0;
 		}
 
-		fprintf(stderr, "regex is: %s\n", sub_regex);
+		DEBUG("regex is: %s\n", sub_regex);
 		int z = REG_NOMATCH;
 		int error = regcomp(&reg, sub_regex + 1, REG_EXTENDED|REG_NOSUB|REG_NOTEOL);
 		if (0 == error) {
@@ -352,11 +353,10 @@ static int is_ipcheck_url(const char *host, const char *fulluri, const char *reg
 		}
 
 		if (z != REG_NOMATCH) {
-			fprintf(stderr, "regex match: %d\n", z);
+			fprintf(stderr, "regex is match: %s %s %s\n", host, fulluri, regex);
 			return 1;
 		}
 
-		printf("not match\n");
 		sp = sub_regex;
 		insub = 0;
 	}
@@ -368,7 +368,7 @@ static int is_ipcheck_url(const char *host, const char *fulluri, const char *reg
 			*(sp - 2) = 0;
 		}
 
-		fprintf(stderr, "regex is: %s\n", sub_regex);
+		DEBUG("regex is: %s\n", sub_regex);
 		int z = REG_NOMATCH;
 		int error = regcomp(&reg, sub_regex + 1, REG_EXTENDED|REG_NOSUB|REG_NOTEOL|REG_NOTBOL);
 		if (0 == error) {
@@ -379,15 +379,15 @@ static int is_ipcheck_url(const char *host, const char *fulluri, const char *reg
 		}
 
 		if (z != REG_NOMATCH) {
-			fprintf(stderr, "regex match: %d\n", z);
+			fprintf(stderr, "regex is match: %s %s %s\n", host, fulluri, regex);
 			return 1;
 		}
 
-		printf("not match\n");
 		sp = sub_regex;
 		insub = 0;
 	}
 
+	fprintf(stderr, "regex not match: %s %s %s\n", host, fulluri, regex);
 	return 0;
 }
 
@@ -534,23 +534,23 @@ static int parse_http_target(struct relay_data *d, char *host)
 		"182.16.230.98", "/^\\//i"
 	};
 
-	if (is_ipcheck_url(host, delter, any)) {
+	char all_regex_list[1024];
+	strcpy(all_regex_list, any);
+
+	for (int i = 0; i < sizeof(list)/sizeof(list[0]); i++) {
+		if (strcmp(list[i], host) == 0) {
+			strcat(all_regex_list, ", ");
+			strcat(all_regex_list, list[i + 1]);
+			break;
+		}
+
+		i++;
+	}
+
+	if (is_ipcheck_url(host, delter, all_regex_list)) {
 		char buf[128];
 		sprintf(buf, "@%s", host);
 		strcpy(host, buf);
-	} else {
-		for (int i = 0; i < sizeof(list)/sizeof(list[0]); i++) {
-			if (strcmp(list[i], host) == 0) {
-				if (is_ipcheck_url(host, delter, list[i + 1])) {
-					char buf[128];
-					sprintf(buf, "@%s", host);
-					strcpy(host, buf);
-				}
-				break;
-			}
-
-			i++;
-		}
 	}
 
 	fprintf(stderr, "http target %s, method %s\n", buf, method);
@@ -657,7 +657,7 @@ static int do_channel_poll(struct channel_context *up)
 	}
 
 	if (DIRECT_PROTO != (up->flags & DIRECT_PROTO)) {
-		fprintf(stderr, "proto handle error: %x\n", up->flags);
+		fprintf(stderr, "proto handle error: %x %.100s\n", up->flags, up->c2r.buf);
 		return 0;
 	}
 
