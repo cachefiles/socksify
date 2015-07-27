@@ -50,7 +50,7 @@ int fill_relay_data(struct relay_data *d, tx_aiocb *f)
 
 	if (d->off >= d->len) d->off = d->len = 0;
 
-	if (tx_readable(f) &&
+	while (tx_readable(f) &&
 			d->len < (int)sizeof(d->buf) && !d->flag) {
 		len = recv(f->tx_fd, d->buf + d->len, sizeof(d->buf) - d->len, 0);
 		tx_aincb_update(f, len);
@@ -109,6 +109,8 @@ int relay_fill_prepare(struct relay_data *d, tx_aiocb *f)
 			d->len < (int)sizeof(d->buf)) {
 		tx_aincb_active(f, &d->rtask);
 		error = 1;
+	} else {
+		printf("f %x %d %d\n", d->flag, tx_readable(f), d->len);
 	}
 
 	return error;
@@ -401,7 +403,7 @@ static int parse_http_target(struct relay_data *d, char *host)
 			memcmp(buf, "https://", 8) &&
 			memmem(d->buf, d->len, "\n\n", 2) == NULL &&
 			memmem(d->buf, d->len, "\r\n\r\n", 4) == NULL) {
-		fprintf(stderr, "request not finish: %s|## %d\n", buf, d->len);
+		//fprintf(stderr, "request not finish: %s|## %d\n", buf, d->len);
 		return 1;
 	}
 
@@ -553,7 +555,7 @@ static int parse_http_target(struct relay_data *d, char *host)
 		strcpy(host, buf);
 	}
 
-	fprintf(stderr, "http target %s, method %s\n", buf, method);
+	//fprintf(stderr, "http target %s, method %s\n", buf, method);
 	return 0;
 }
 
@@ -608,7 +610,9 @@ static int do_channel_poll(struct channel_context *up)
 		change = fill_relay_data(&up->c2r, &up->file);
 		up->flags |= check_proxy_proto(&up->c2r);
 		if (NONE_PROTO == (up->flags & SUPPORTED_PROTO)) {
-			return relay_fill_prepare(&up->c2r, &up->file);
+			int prep = relay_fill_prepare(&up->c2r, &up->file);
+			fprintf(stderr, "%p proto detected return : %x \n", up, prep);
+			return prep;
 		}
 
 		fprintf(stderr, "proto detected: %x\n", up->flags);
@@ -657,7 +661,7 @@ static int do_channel_poll(struct channel_context *up)
 	}
 
 	if (DIRECT_PROTO != (up->flags & DIRECT_PROTO)) {
-		fprintf(stderr, "proto handle error: %x %.100s\n", up->flags, up->c2r.buf);
+		fprintf(stderr, "proto handle error: %x \n", up->flags);
 		return 0;
 	}
 
