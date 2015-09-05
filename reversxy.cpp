@@ -41,6 +41,8 @@ struct relay_data {
 
 	tx_task_t rtask;
 	tx_task_t wtask;
+
+	int stat_total;
 };
 
 int fill_relay_data(struct relay_data *d, tx_aiocb *f)
@@ -78,6 +80,7 @@ int write_relay_data(struct relay_data *d, tx_aiocb *f)
 			if (len > 0) {
 				change |= (len > 0);
 				d->off += len;
+				d->stat_total += len;
 			} else if (tx_writable(f)) {
 				return 0x2;
 			}
@@ -396,27 +399,25 @@ static int is_ipcheck_url(const char *host, const char *fulluri, const char *reg
 static int parse_http_target(struct relay_data *d, char *host)
 {
 	char *p, *delter;
-	char buf[512], method[16];
-	sscanf(d->buf, "%s %s", method, buf);
+	char uri[512], method[16], ver[16];
+	sscanf(d->buf, "%s %s %s", method, uri, ver);
 
-	if (memcmp(buf, "http://", 7) &&
-			memcmp(buf, "https://", 8) &&
-			memmem(d->buf, d->len, "\n\n", 2) == NULL &&
-			memmem(d->buf, d->len, "\r\n\r\n", 4) == NULL) {
-		//fprintf(stderr, "request not finish: %s|## %d\n", buf, d->len);
+	if (memmem(d->buf, d->len, "\r\n\r\n", 4) == NULL &&
+			(memcmp(uri, "http://", 7) && memcmp(uri, "https://", 8) || memmem(d->buf, d->len, "\r\n", 2) == NULL)) {
+		fprintf(stderr, "request not finish: ##|%s|## %d %s %s %s\n", d->buf, d->len, method, uri, ver);
 		return 1;
 	}
 
-	delter = (buf + 7);
-	if (*buf == '/' && d->len < sizeof(d->buf)) {
-		char path[512];
+	delter = (uri + 7);
+	if (*uri == '/' && d->len < sizeof(d->buf)) {
 		d->buf[d->len] = 0;
+
+		char host[512], path[512];
 		p = strcasestr(d->buf, "\nHost: ");
 		if (p != NULL) {
-			strcpy(path, buf);
-			sscanf(p + 7, "%s", buf);
-			strcat(buf, path);
-			delter = buf;
+			strcpy(path, uri);
+			sscanf(p + 7, "%s", host);
+			sprintf(uri, "http://%s%s", host, path);
 		}
 	}
 
@@ -424,112 +425,114 @@ static int parse_http_target(struct relay_data *d, char *host)
 	if (p) {
 		memcpy(host, delter, p - delter);
 		host[p - delter] = 0;
+		delter = p;
 	} else {
 		strcpy(host, delter);
 	}
 
 	const char *any = "/^[^/]*\\.dpool\\.sina\\.com\\.cn\\/iplookup/i, /^[^/]*/vrs_flash\\.action/i";
 	const char *list[] = {
-		"v.youku.com", "/^\\/player\\//i",
-		"api.youku.com", "/^\\/player\\//i",
-		"play.youku.com", "/^\\/play\\/get\\.json/i",
-		"v2.tudou.com", "/^\\//i",
-		"www.tudou.com", "/^\\/a\\//i, /^\\/v\\//i, /^\\/outplay\\/goto\\/getTvcCode/i, /^\\/tvp\\/alist\\.action/i",
-		"s.plcloud.music.qq.com", "/^\\/fcgi\\-bin\\/p\\.fcg/i",
-		"i.y.qq.com", "/^\\/s\\.plcloud\\/fcgi\\-bin\\/p\\.fcg/i",
-		"hot.vrs.sohu.com", "/^\\//i",
-		"live.tv.sohu.com", "/^\\/live\\/player/i",
-		"pad.tv.sohu.com", "/^\\/playinfo/i",
-		"my.tv.sohu.com", "/^\\/play\\/m3u8version\\.do/i",
-		"hot.vrs.letv.com", "/^\\//i",
-		"data.video.qiyi.com", "/^\\/v\\./i,/^\\/videos\\//i,/^\\/.*\\/videos\\//i",
-		"cache.video.qiyi.com", "/^\\/vms\\?/i,/^\\/vp\\/.*\\/.*\\/\\?src=/i,/^\\/vps\\?/i",
-		"cache.vip.qiyi.com", "/^\\/vms\\?/i",
-		"v.api.hunantv.com", "/^\\/player\\/video/i",
-		"vv.video.qq.com", "/^\\//i,/^\\/getvinfo/i, /^\\/getinfo/i,/^\\/geturl/i",
-		"tt.video.qq.com", "/^\\/getvinfo/i",
-		"ice.video.qq.com", "/^\\/getvinfo/i",
-		"tjsa.video.qq.com", "/^\\/getvinfo/i",
-		"a10.video.qq.com", "/^\\/getvinfo/i",
-		"xyy.video.qq.com", "/^\\/getvinfo/i",
-		"vcq.video.qq.com", "/^\\/getvinfo/i",
-		"vsh.video.qq.com", "/^\\/getvinfo/i",
-		"vbj.video.qq.com", "/^\\/getvinfo/i",
-		"bobo.video.qq.com", "/^\\/getvinfo/i",
-		"flvs.video.qq.com", "/^\\/getvinfo/i",
-		"bkvv.video.qq.com", "/^\\/getvinfo/i",
-		"info.zb.qq.com", "/^\\/\\?/i",
-		"geo.js.kankan.xunlei.com", "/^\\//i",
-		"web-play.pptv.com", "/^\\//i",
-		"web-play.pplive.cn", "/^\\//i",
-		"dyn.ugc.pps.tv", "/^\\//i",
-		"v.pps.tv", "/^\\/ugc\\/ajax\\/aj_html5_url\\.php/i",
-		"inner.kandian.com", "/^\\//i",
-		"ipservice.163.com", "/^\\//i",
-		"so.open.163.com", "/^\\/open\\/info\\.htm/i",
-		"zb.s.qq.com", "/^\\//i",
-		"ip.kankan.xunlei.com", "/^\\//i",
-		"vxml.56.com", "/^\\/json\\//i",
-		"music.sina.com.cn", "/^\\/yueku\\/intro\\//i, /^\\/radio\\/port\\/webFeatureRadioLimitList\\.php/i",
-		"play.baidu.com", "/^\\/data\\/music\\/songlink/i",
-		"v.iask.com", "/^\\/v_play\\.php/i,/^\\/v_play_ipad\\.cx\\.php/i",
-		"tv.weibo.com", "/^\\/player\\//i",
-		"wtv.v.iask.com", "/^\\/.*\\.m3u8/i,/^\\/mcdn\\.php$/i",
-		"video.sina.com.cn", "/^\\/interface\\/l\\/u\\/getFocusStatus\\.php/i",
-		"www.yinyuetai.com", "/^\\/insite\\//i,/^\\/main\\/get\\-/i",
-		"api.letv.com", "/^\\/streamblock/i,/^\\/mms\\/out\\/video\\/play/i,/^\\/mms\\/out\\/common\\/geturl/i,/^\\/geturl/i,/^\\/api\\/geturl/i,/^\\/getipgeo$/i",
-		"st.live.letv.com", "/^\\/live\\//i",
-		"live.gslb.letv.com", "/^\\/gslb\\?/i",
-		"static.itv.letv.com", "/^\\/api/i",
-		"ip.apps.cntv.cn", "/^\\/js\\/player\\.do/i",
-		"vdn.apps.cntv.cn", "/^\\/api\\/get/i, /^\\/api\\/getLiveUrlCommonApi\\.do\\?pa:\\/\\/cctv_p2p_hdcctv5/i, /^\\/api\\/getLiveUrlCommonApi\\.do\\?pa:\\/\\/cctv_p2p_hdcctv6/i, /^\\/api\\/getLiveUrlCommonApi\\.do\\?pa:\\/\\/cctv_p2p_hdcctv8/i, /^\\/api\\/getLiveUrlCommonApi\\.do\\?pa:\\/\\/cctv_p2p_hdbtv6/i",
-		"vdn.live.cntv.cn", "/^\\/api2\\/liveHtml5\\.do\\?channel=pa:\\/\\/cctv_p2p_hdcctv5/i, /^\\/api2\\/liveHtml5\\.do\\?channel=pa:\\/\\/cctv_p2p_hdcctv6/i, /^\\/api2\\/liveHtml5\\.do\\?channel=pa:\\/\\/cctv_p2p_hdcctv8/i, /^\\/api2\\/liveHtml5\\.do\\?channel=pa:\\/\\/cctv_p2p_hdbtv6/i, /^\\/api2\\/live\\.do\\?channel=pa:\\/\\/cctv_p2p_hdcctv5/i, /^\\/api2\\/live\\.do\\?channel=pa:\\/\\/cctv_p2p_hdcctv6/i, /^\\/api2\\/live\\.do\\?channel=pa:\\/\\/cctv_p2p_hdcctv8/i, /^\\/api2\\/live\\.do\\?channel=pa:\\/\\/cctv_p2p_hdbtv6/i",
-		"vip.sports.cntv.cn", "/^\\/check\\.do/i,/^\\/play\\.do/i, /^\\/servlets\\/encryptvideopath\\.do/i",
-		"211.151.157.15", "/^\\//i",
-		"a.play.api.3g.youku.com", "/^\\/common\\/v3\\/play\\?/i",
-		"i.play.api.3g.youku.com", "/^\\/common\\/v3\\/play\\?/i,/^\\/common\\/v3\\/hasadv\\/play\\?/i",
-		"api.3g.youku.com", "/^\\/layout/i, /^\\/v3\\/play\\/address/i, /^\\/openapi\\-wireless\\/videos\\/.*\\/download/i, /^\\/videos\\/.*\\/download/i, /^\\/common\\/v3\\/play/i",
-		"statis.api.3g.youku.com", "/^\\/layout/i, /^\\/v3\\/play\\/address/i, /^\\/openapi\\-wireless\\/videos\\/.*\\/download/i, /^\\/videos\\/.*\\/download/i, /^\\/common\\/v3\\/play/i",
-		"tv.api.3g.youku.com", "/^\\/openapi\\-wireless\\/v3\\/play\\/address/i, /^\\/common\\/v3\\/hasadv\\/play/i, /^\\/common\\/v3\\/play/i",
-		"play.api.3g.youku.com", "/^\\/common\\/v3\\/hasadv\\/play/i, /^\\/common\\/v3\\/play/i,/^\\/v3\\/play\\/address/i",
-		"play.api.3g.tudou.com", "/^\\/v/i",
-		"tv.api.3g.tudou.com", "/^\\/tv\\/play\\?/i",
-		"api.3g.tudou.com", "/^\\//i",
-		"api.tv.sohu.com", "/^\\/mobile_user\\/device\\/clientconf\\.json\\?/i",
-		"access.tv.sohu.com", "/^\\//i",
-		"iface.iqiyi.com", "/^\\/api\\/searchIface\\?/i",
-		"iface2.iqiyi.com", "/^\\/php\\/xyz\\/iface\\//i,/^\\/php\\/xyz\\/entry\\/galaxy\\.php\\?/i,/^\\/php\\/xyz\\/entry\\/nebula\\.php\\?/i",
-		"cache.m.iqiyi.com", "/^\\/jp\\/tmts\\//i",
-		"dynamic.app.m.letv.com", "/^\\/.*\\/dynamic\\.php\\?.*ctl=videofile/i",
-		"dynamic.meizi.app.m.letv.com", "/^\\/.*\\/dynamic\\.php\\?.*ctl=videofile/i",
-		"dynamic.search.app.m.letv.com", "/^\\/.*\\/dynamic\\.php\\?.*ctl=videofile/i",
-		"dynamic.live.app.m.letv.com", "/^\\/.*\\/dynamic\\.php\\?.*act=canplay/i",
-		"listso.m.areainfo.ppstream.com", "/^\\/ip\\/q\\.php/i",
-		"epg.api.pptv.com", "/^\\/detail\\.api\\?/i",
-		"play.api.pptv.com", "/^\\/boxplay\\.api\\?/i",
-		"m.letv.com", "/^\\/api\\/geturl\\?/i",
-		"interface.bilibili.com", "/^\\/playurl\\?/i",
-		"3g.music.qq.com", "/^\\//i",
-		"mqqplayer.3g.qq.com", "/^\\//i",
-		"proxy.music.qq.com", "/^\\//i",
-		"proxymc.qq.com", "/^\\//i",
-		"ip2.kugou.com", "/^\\/check\\/isCn\\//i",
-		"ip.kugou.com", "/^\\/check\\/isCn\\//i",
-		"client.api.ttpod.com", "/^\\/global/i",
-		"mobi.kuwo.cn", "/^\\//i",
-		"mobilefeedback.kugou.com", "/^\\//i",
-		"tingapi.ting.baidu.com", "/^\\/v1\\/restserver\\/ting\\?.*method=baidu\\.ting\\.song/i",
-		"music.baidu.com", "/^\\/data\\/music\\/links\\?/i",
-		"serviceinfo.sdk.duomi.com", "/^\\/api\\/serviceinfo\\/getserverlist/i",
-		"music.163.com", "/^\\/api\\/copyright\\/restrict\\/\\?/i,/^\\/api\\/batch$/i",
-		"www.xiami.com", "/^\\/web\\/spark/i,/^\\/web\\/.*\\?.*xiamitoken=/i",
-		"spark.api.xiami.com", "/^\\/api\\?.*method=AuthIp/i,/^\\/api\\?.*method=Start\\.init/i,/^\\/api\\?.*method=Songs\\.getTrackDetail/i,/^\\/api\\?.*method=Songs\\.detail/i",
-		"iplocation.geo.qiyi.com", "/^\\/cityjson$/i",
-		"sns.video.qq.com", "/^\\/tunnel\\/fcgi\\-bin\\/tunnel/i",
-		"v5.pc.duomi.com", "/^\\/single\\-ajaxsingle\\-isban/i",
-		"tms.is.ysten.com", "/^:8080\\/yst\\-tms\\/login\\.action\\?/i",
-		"chrome.2345.com", "/^\\/dianhua\\/mobileApi\\/check\\.php$/i",
-		"internal.check.duokanbox.com", "/^\\/check\\.json/i",
+		"v.youku.com","/^\\/player\\//i",
+		"api.youku.com","/^\\/player\\//i",
+		"play.youku.com","/^\\/play\\/get\\.json/i",
+		"v2.tudou.com","/^\\//i",
+		"www.tudou.com","/^\\/a\\//i,/^\\/v\\//i,/^\\/outplay\\/goto\\/getTvcCode/i,/^\\/tvp\\/alist\\.action/i",
+		"s.plcloud.music.qq.com","/^\\/fcgi\\-bin\\/p\\.fcg/i",
+		"i.y.qq.com","/^\\/s\\.plcloud\\/fcgi\\-bin\\/p\\.fcg/i",
+		"hot.vrs.sohu.com","/^\\//i",
+		"live.tv.sohu.com","/^\\/live\\/player/i",
+		"pad.tv.sohu.com","/^\\/playinfo/i",
+		"my.tv.sohu.com","/^\\/play\\/m3u8version\\.do/i",
+		"hot.vrs.letv.com","/^\\//i",
+		"data.video.qiyi.com","/^\\/v\\./i,/^\\/videos\\//i,/^\\/.*\\/videos\\//i",
+		"cache.video.qiyi.com","/^\\/vms\\?/i,/^\\/vp\\/.*\\/.*\\/\\?src=/i,/^\\/vps\\?/i,/^\\/liven\\//i",
+		"cache.vip.qiyi.com","/^\\/vms\\?/i",
+		"v.api.hunantv.com","/^\\/player\\/video/i",
+		"vv.video.qq.com","/^\\//i,/^\\/getvinfo/i,/^\\/getinfo/i,/^\\/geturl/i",
+		"tt.video.qq.com","/^\\/getvinfo/i",
+		"ice.video.qq.com","/^\\/getvinfo/i",
+		"tjsa.video.qq.com","/^\\/getvinfo/i",
+		"a10.video.qq.com","/^\\/getvinfo/i",
+		"xyy.video.qq.com","/^\\/getvinfo/i",
+		"vcq.video.qq.com","/^\\/getvinfo/i",
+		"vsh.video.qq.com","/^\\/getvinfo/i",
+		"vbj.video.qq.com","/^\\/getvinfo/i",
+		"bobo.video.qq.com","/^\\/getvinfo/i",
+		"flvs.video.qq.com","/^\\/getvinfo/i",
+		"bkvv.video.qq.com","/^\\/getvinfo/i",
+		"info.zb.qq.com","/^\\/\\?/i",
+		"geo.js.kankan.xunlei.com","/^\\//i",
+		"web-play.pptv.com","/^\\//i",
+		"web-play.pplive.cn","/^\\//i",
+		"dyn.ugc.pps.tv","/^\\//i",
+		"v.pps.tv","/^\\/ugc\\/ajax\\/aj_html5_url\\.php/i",
+		"inner.kandian.com","/^\\//i",
+		"ipservice.163.com","/^\\//i",
+		"so.open.163.com","/^\\/open\\/info\\.htm/i",
+		"zb.s.qq.com","/^\\//i",
+		"ip.kankan.xunlei.com","/^\\//i",
+		"vxml.56.com","/^\\/json\\//i",
+		"music.sina.com.cn","/^\\/yueku\\/intro\\//i,/^\\/radio\\/port\\/webFeatureRadioLimitList\\.php/i",
+		"play.baidu.com","/^\\/data\\/music\\/songlink/i",
+		"v.iask.com","/^\\/v_play\\.php/i,/^\\/v_play_ipad\\.cx\\.php/i",
+		"tv.weibo.com","/^\\/player\\//i",
+		"wtv.v.iask.com","/^\\/.*\\.m3u8/i,/^\\/mcdn\\.php$/i,/^\\/player\\/ovs1_idc_list\\.php/i",
+		"video.sina.com.cn","/^\\/interface\\/l\\/u\\/getFocusStatus\\.php/i",
+		"www.yinyuetai.com","/^\\/insite\\//i,/^\\/main\\/get\\-/i",
+		"api.letv.com","/^\\/streamblock/i,/^\\/mms\\/out\\/video\\/play/i,/^\\/mms\\/out\\/common\\/geturl/i,/^\\/geturl/i,/^\\/api\\/geturl/i,/^\\/getipgeo$/i",
+		"st.live.letv.com","/^\\/live\\//i",
+		"live.gslb.letv.com","/^\\/gslb\\?/i",
+		"static.itv.letv.com","/^\\/api/i",
+		"ip.apps.cntv.cn","/^\\/js\\/player\\.do/i",
+		"vdn.apps.cntv.cn","/^\\/api\\/get/i,/^\\/api\\/getLiveUrlCommonApi\\.do\\?pa:\\/\\/cctv_p2p_hdcctv5/i,/^\\/api\\/getLiveUrlCommonApi\\.do\\?pa:\\/\\/cctv_p2p_hdcctv6/i,/^\\/api\\/getLiveUrlCommonApi\\.do\\?pa:\\/\\/cctv_p2p_hdcctv8/i,/^\\/api\\/getLiveUrlCommonApi\\.do\\?pa:\\/\\/cctv_p2p_hdbtv6/i",
+		"vdn.live.cntv.cn","/^\\/api2\\/liveHtml5\\.do\\?channel=pa:\\/\\/cctv_p2p_hdcctv5/i,/^\\/api2\\/liveHtml5\\.do\\?channel=pa:\\/\\/cctv_p2p_hdcctv6/i,/^\\/api2\\/liveHtml5\\.do\\?channel=pa:\\/\\/cctv_p2p_hdcctv8/i,/^\\/api2\\/liveHtml5\\.do\\?channel=pa:\\/\\/cctv_p2p_hdbtv6/i,/^\\/api2\\/live\\.do\\?channel=pa:\\/\\/cctv_p2p_hdcctv5/i,/^\\/api2\\/live\\.do\\?channel=pa:\\/\\/cctv_p2p_hdcctv6/i,/^\\/api2\\/live\\.do\\?channel=pa:\\/\\/cctv_p2p_hdcctv8/i,/^\\/api2\\/live\\.do\\?channel=pa:\\/\\/cctv_p2p_hdbtv6/i",
+		"vip.sports.cntv.cn","/^\\/check\\.do/i,/^\\/play\\.do/i,/^\\/servlets\\/encryptvideopath\\.do/i",
+		"211.151.157.15","/^\\//i",
+		"a.play.api.3g.youku.com","/^\\/common\\/v3\\/play\\?/i",
+		"i.play.api.3g.youku.com","/^\\/common\\/v3\\/play\\?/i,/^\\/common\\/v3\\/hasadv\\/play\\?/i",
+		"api.3g.youku.com","/^\\/layout/i,/^\\/v3\\/play\\/address/i,/^\\/openapi\\-wireless\\/videos\\/.*\\/download/i,/^\\/videos\\/.*\\/download/i,/^\\/common\\/v3\\/play/i",
+		"tv.api.3g.youku.com","/^\\/openapi\\-wireless\\/v3\\/play\\/address/i,/^\\/common\\/v3\\/hasadv\\/play/i,/^\\/common\\/v3\\/play/i",
+		"play.api.3g.youku.com","/^\\/common\\/v3\\/hasadv\\/play/i,/^\\/common\\/v3\\/play/i,/^\\/v3\\/play\\/address/i",
+		"play.api.3g.tudou.com","/^\\/v/i",
+		"tv.api.3g.tudou.com","/^\\/tv\\/play\\?/i",
+		"api.3g.tudou.com","/^\\//i",
+		"api.tv.sohu.com","/^\\/mobile_user\\/device\\/clientconf\\.json\\?/i",
+		"access.tv.sohu.com","/^\\//i",
+		"iface.iqiyi.com","/^\\/api\\/searchIface\\?/i",
+		"iface2.iqiyi.com","/^\\/php\\/xyz\\/iface\\//i,/^\\/php\\/xyz\\/entry\\/galaxy\\.php\\?/i,/^\\/php\\/xyz\\/entry\\/nebula\\.php\\?/i",
+		"cache.m.iqiyi.com","/^\\/jp\\/tmts\\//i",
+		"dynamic.app.m.letv.com","/^\\/.*\\/dynamic\\.php\\?.*ctl=videofile/i",
+		"dynamic.meizi.app.m.letv.com","/^\\/.*\\/dynamic\\.php\\?.*ctl=videofile/i",
+		"dynamic.search.app.m.letv.com","/^\\/.*\\/dynamic\\.php\\?.*ctl=videofile/i",
+		"dynamic.live.app.m.letv.com","/^\\/.*\\/dynamic\\.php\\?.*act=canplay/i",
+		"listso.m.areainfo.ppstream.com","/^\\/ip\\/q\\.php/i",
+		"epg.api.pptv.com","/^\\/detail\\.api\\?/i",
+		"play.api.pptv.com","/^\\/boxplay\\.api\\?/i",
+		"m.letv.com","/^\\/api\\/geturl\\?/i",
+		"api.mob.app.letv.com","/^\\/play/i",
+		"interface.bilibili.com","/^\\/playurl\\?/i",
+		"3g.music.qq.com","/^\\//i",
+		"mqqplayer.3g.qq.com","/^\\//i",
+		"proxy.music.qq.com","/^\\//i",
+		"proxymc.qq.com","/^\\//i",
+		"ip2.kugou.com","/^\\/check\\/isCn\\//i",
+		"ip.kugou.com","/^\\/check\\/isCn\\//i",
+		"client.api.ttpod.com","/^\\/global/i",
+		"mobi.kuwo.cn","/^\\//i",
+		"mobilefeedback.kugou.com","/^\\//i",
+		"tingapi.ting.baidu.com","/^\\/v1\\/restserver\\/ting\\?.*method=baidu\\.ting\\.song/i",
+		"music.baidu.com","/^\\/data\\/music\\/links\\?/i",
+		"serviceinfo.sdk.duomi.com","/^\\/api\\/serviceinfo\\/getserverlist/i",
+		"music.163.com","/^\\/api\\/copyright\\/restrict\\/\\?/i,/^\\/api\\/batch$/i",
+		"www.xiami.com","/^\\/web\\/spark/i,/^\\/web\\/.*\\?.*xiamitoken=/i",
+		"spark.api.xiami.com","/^\\/api\\?.*method=AuthIp/i,/^\\/api\\?.*method=Start\\.init/i,/^\\/api\\?.*method=Songs\\.getTrackDetail/i,/^\\/api\\?.*method=Songs\\.detail/i",
+		"iplocation.geo.qiyi.com","/^\\/cityjson$/i",
+		"sns.video.qq.com","/^\\/tunnel\\/fcgi\\-bin\\/tunnel/i",
+		"v5.pc.duomi.com","/^\\/single\\-ajaxsingle\\-isban/i",
+		"tms.is.ysten.com","/^:8080\\/yst\\-tms\\/login\\.action\\?/i",
+		"chrome.2345.com","/^\\/dianhua\\/mobileApi\\/check\\.php$/i",
+		"internal.check.duokanbox.com","/^\\/check\\.json/i",
+
 		"180.153.225.136", "/^\\//i",
 		"118.244.244.124", "/^\\//i",
 		"210.129.145.150", "/^\\//i",
@@ -550,9 +553,18 @@ static int parse_http_target(struct relay_data *d, char *host)
 	}
 
 	if (is_ipcheck_url(host, delter, all_regex_list)) {
-		char buf[128];
-		sprintf(buf, "@%s", host);
-		strcpy(host, buf);
+		char *p;
+		char savehost[128], followlines[4096];
+		strcpy(savehost, host);
+		sprintf(host, "@%s", savehost);
+
+		p = (char *)memmem(d->buf, d->len, "\r\n", 2);
+		if (p != NULL) {
+			memcpy(followlines, p, d->buf + d->len - p);
+			followlines[d->buf + d->len - p] = 0;
+			d->len = sprintf(d->buf, "%s %s %s%s", method, uri, ver, followlines);
+			fprintf(stderr, "rebuild data ###[%s]##\n", d->buf);
+		}
 	}
 
 	//fprintf(stderr, "http target %s, method %s\n", buf, method);
@@ -567,7 +579,7 @@ static int do_host_connect(tx_aiocb *s, char *domain, int port, tx_task_t *t)
 	tx_loop_t *loop = tx_loop_default();
 
 	info.port = htons(port);
-	if (*domain == '@') domain = "proxy.uku.im:8888";
+	if (*domain == '@') domain = "proxy.uku.im:443";
 	error = get_target_address(&info, domain);
 	if (error != 0) {
 		fprintf(stderr, "failure targethost: %s\n", domain);
@@ -700,7 +712,7 @@ static void do_channel_wrapper(void *up)
 	err = do_channel_poll(upp);
 
 	if (err == 0) {
-		fprintf(stderr, "channel release\n");
+		fprintf(stderr, "channel release %d %d\n", upp->c2r.stat_total, upp->r2c.stat_total);
 		do_channel_release(upp);
 		return;
 	}
