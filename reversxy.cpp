@@ -45,6 +45,71 @@ struct relay_data {
 	int stat_total;
 };
 
+int _pretect_req;
+int _protect_count = 0;
+int _protect_socks[1024];
+struct tx_task_t _protect_task;
+struct tx_task_q _protect_cond;
+
+static void wait_protected_socket(tx_task_t *task)
+{
+	tx_loop_t *loop = tx_loop_default();
+
+	if (_protect_count > 0) {
+		tx_task_active(task);
+		return;
+	}
+
+	tx_task_record(&_protect_cond, task);
+	if (_pretect_req == 0) {
+		tx_task_active(&_protect_task);
+		tx_loop_break(loop);
+	}
+
+	_pretect_req++;
+}
+
+int get_protect_socket()
+{
+	if (_protect_count > 0)
+		return _protect_socks[--_protect_count];
+	return -1;
+}
+
+void check_protect_socks(void *upp)
+{
+	tx_loop_t *loop = tx_loop_default();
+
+	if (!LIST_EMPTY(&_protect_cond)
+			&& _protect_count < 1024) {
+		tx_task_active(&_protect_task);
+		tx_loop_break(loop);
+	}
+
+	return;
+}
+
+int get_socket()
+{
+	if (_pretect_req <= 0
+			&& _protect_count > 5) {
+		return -1;
+	}
+
+	return socket(AF_INET, SOCK_STREAM, 0);
+}
+
+void add_protect_socket(int newfd)
+{
+	if (newfd >= 0) {
+		_protect_socks[_protect_count++] = newfd;
+		tx_task_wakeup(&_protect_cond);
+		if (_pretect_req > 0) _pretect_req--;
+	}
+
+	return;
+}
+
 int fill_relay_data(struct relay_data *d, tx_aiocb *f)
 {
 	int len;
@@ -572,6 +637,34 @@ static int parse_http_target(struct relay_data *d, char *host)
 	return 0;
 }
 
+static int do_forward_connect(int peerfd, tx_aiocb *s, char *domain, tx_task_t *t)
+{
+	int error = -1;
+	struct sockaddr_in sin0;
+	struct tcpip_info info = {0};
+	tx_loop_t *loop = tx_loop_default();
+
+	error = get_target_address(&info, domain);
+	if (error != 0) {
+		fprintf(stderr, "failure targethost: %s\n", domain);
+		return -1;
+	}
+
+	tx_setblockopt(peerfd, 0);
+
+	memset(&sin0, 0, sizeof(sin0));
+	sin0.sin_family = AF_INET;
+	error = bind(peerfd, (struct sockaddr *)&sin0, sizeof(sin0));
+
+	tx_aiocb_init(s, loop, peerfd);
+
+	sin0.sin_family = AF_INET;
+	sin0.sin_port   = (info.port);
+	sin0.sin_addr.s_addr = (info.address);
+	fprintf(stderr, "connect to %s: %x:%d\n", domain, info.address, htons(info.port));
+	return tx_aiocb_connect(s, (struct sockaddr *)&sin0, sizeof(sin0), t);
+}
+
 static int do_host_connect(tx_aiocb *s, char *domain, int port, tx_task_t *t)
 {
 	int error = -1;
@@ -673,11 +766,19 @@ static int do_channel_poll(struct channel_context *up)
 	}
 
 	if (FORWARD_PROTO & up->flags) {
-		if (do_host_connect(&up->remote, "192.168.1.1:7777", 80, &up->task) == -1) {
+		int peerfd = get_protect_socket();
+		if (peerfd == -1) {
+			wait_protected_socket(&up->task);
+			return 1;
+		}
+
+		if (do_forward_connect(peerfd, &up->remote, "192.168.1.1:7777", &up->task) == -1) {
 			return 0;
 		}
+
 		up->flags |= (START_PROTO| DIRECT_PROTO);
 		up->flags &= ~FORWARD_PROTO;
+		return 1;
 	}
 
 	if (DIRECT_PROTO != (up->flags & DIRECT_PROTO)) {
@@ -862,9 +963,27 @@ int main(int argc, char *argv[])
 	err = get_target_address(&info, argv[1]);
 	TX_CHECK(err == 0, "get target address failure");
 
+	LIST_INIT(&_protect_cond);
+	tx_task_init(&_protect_task, loop, check_protect_socks, loop);
 	upp = txlisten_create(&info);
 
-	tx_loop_main(loop);
+	for ( ; ; ) {
+		int fd;
+		tx_loop_main(loop);
+
+		fd = get_socket();
+		if (fd == -1) {
+			break;
+		}
+
+		do {
+			/* protect socket */
+			fprintf(stderr, "Hell World: %d protect\n", fd);
+			add_protect_socket(fd);
+			fd = get_socket();
+		} while (fd != -1);
+	}
+
 	tx_loop_delete(loop);
 
 	TX_UNUSED(last_tick);
