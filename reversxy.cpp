@@ -113,7 +113,7 @@ int relay_fill_prepare(struct relay_data *d, tx_aiocb *f)
 		tx_aincb_active(f, &d->rtask);
 		error = 1;
 	} else {
-		printf("f %x %d %d\n", d->flag, tx_readable(f), d->len);
+		printf("fallback %x %d %d\n", d->flag, tx_readable(f), d->len);
 	}
 
 	return error;
@@ -132,19 +132,20 @@ int relay_write_prepare(struct relay_data *d, tx_aiocb *f)
 }
 
 enum {
-    NONE_PROTO = 0,
-    UNKOWN_PROTO = (1 << 0),
-    SOCKV4_PROTO = (1 << 1),
-    SOCKV5_PROTO = (1 << 2),
+	NONE_PROTO = 0,
+	UNKOWN_PROTO = (1 << 0),
+	SOCKV4_PROTO = (1 << 1),
+	SOCKV5_PROTO = (1 << 2),
 
-    HTTP_PROTO = (1 << 3),
+	HTTP_PROTO = (1 << 3),
 	HTTPS_PROTO = (1 << 4),
+	FORWARD_PROTO = (1 << 5),
 
-    START_PROTO = (1 << 5),
-	DIRECT_PROTO = (1 << 6),
+	START_PROTO = (1 << 6),
+	DIRECT_PROTO = (1 << 7),
 };
 
-static const int SUPPORTED_PROTO = UNKOWN_PROTO| SOCKV4_PROTO| SOCKV5_PROTO| HTTP_PROTO| HTTPS_PROTO| DIRECT_PROTO ;
+static const int SUPPORTED_PROTO = UNKOWN_PROTO| SOCKV4_PROTO| SOCKV5_PROTO| HTTP_PROTO| HTTPS_PROTO| FORWARD_PROTO| DIRECT_PROTO ;
 
 static int check_proxy_proto(struct relay_data *d)
 {
@@ -617,7 +618,6 @@ static int do_channel_poll(struct channel_context *up)
 		up->flags &= ~START_PROTO;
 	}
 
-
 	if (NONE_PROTO == (up->flags & SUPPORTED_PROTO)) {
 		change = fill_relay_data(&up->c2r, &up->file);
 		up->flags |= check_proxy_proto(&up->c2r);
@@ -670,6 +670,14 @@ static int do_channel_poll(struct channel_context *up)
 		up->flags |= (START_PROTO| DIRECT_PROTO);
 		up->flags &= ~HTTP_PROTO;
 		return 1;
+	}
+
+	if (FORWARD_PROTO & up->flags) {
+		if (do_host_connect(&up->remote, "192.168.1.1:7777", 80, &up->task) == -1) {
+			return 0;
+		}
+		up->flags |= (START_PROTO| DIRECT_PROTO);
+		up->flags &= ~FORWARD_PROTO;
 	}
 
 	if (DIRECT_PROTO != (up->flags & DIRECT_PROTO)) {
@@ -762,6 +770,9 @@ static void do_channel_prepare(struct channel_context *up, int newfd, unsigned s
 	up->c2r.len = up->c2r.off = 0;
 	up->r2c.flag = 0;
 	up->r2c.len = up->r2c.off = 0;
+#if defined(USE_JUST_FORWARD)
+	up->flags |= FORWARD_PROTO;
+#endif
 
 	fprintf(stderr, "newfd: %d to here\n", newfd);
 	return;
@@ -839,6 +850,7 @@ int main(int argc, char *argv[])
 
 	tx_loop_t *loop = tx_loop_default();
 	tx_poll_t *poll = tx_epoll_init(loop);
+	tx_poll_t *poll2 = tx_kqueue_init(loop);
 	tx_poll_t *poll1 = tx_completion_port_init(loop);
 	tx_timer_ring *provider = tx_timer_ring_get(loop);
 	tx_timer_ring *provider1 = tx_timer_ring_get(loop);
