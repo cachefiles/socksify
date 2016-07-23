@@ -45,7 +45,7 @@ struct relay_data {
 	int stat_total;
 };
 
-int _pretect_req;
+int _protect_req = 0;
 int _protect_count = 0;
 int _protect_socks[1024];
 struct tx_task_t _protect_task;
@@ -61,12 +61,12 @@ static void wait_protected_socket(tx_task_t *task)
 	}
 
 	tx_task_record(&_protect_cond, task);
-	if (_pretect_req == 0) {
+	if (_protect_req == 0) {
 		tx_task_active(&_protect_task);
 		tx_loop_break(loop);
 	}
 
-	_pretect_req++;
+	_protect_req++;
 }
 
 int get_protect_socket()
@@ -91,8 +91,9 @@ void check_protect_socks(void *upp)
 
 int get_socket()
 {
-	if (_pretect_req <= 0
+	if (_protect_req <= 0
 			&& _protect_count > 5) {
+		printf("empty socket\n");
 		return -1;
 	}
 
@@ -104,7 +105,7 @@ void add_protect_socket(int newfd)
 	if (newfd >= 0) {
 		_protect_socks[_protect_count++] = newfd;
 		tx_task_wakeup(&_protect_cond);
-		if (_pretect_req > 0) _pretect_req--;
+		if (_protect_req > 0) _protect_req--;
 	}
 
 	return;
@@ -332,6 +333,7 @@ static void do_channel_release(struct channel_context *up)
 	tx_task_drop(&up->c2r.wtask);
 	tx_task_drop(&up->r2c.rtask);
 	tx_task_drop(&up->r2c.wtask);
+	tx_task_drop(&up->task);
 
 	delete up;
 }
@@ -973,17 +975,19 @@ int main(int argc, char *argv[])
 
 		fd = get_socket();
 		if (fd == -1) {
+			perror("socket");
 			break;
 		}
 
 		do {
 			/* protect socket */
-			fprintf(stderr, "Hell World: %d protect\n", fd);
 			add_protect_socket(fd);
 			fd = get_socket();
 		} while (fd != -1);
 	}
 
+	fprintf(stderr, "Hello World protect %d %d %d %d\n",
+			LIST_EMPTY(&_protect_cond), _protect_req, _protect_count, getdtablesize());
 	tx_loop_delete(loop);
 
 	TX_UNUSED(last_tick);
