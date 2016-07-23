@@ -143,7 +143,7 @@ extern "C" int get_socket()
 	return socket(AF_INET, SOCK_STREAM, 0);
 }
 
-void add_protect_socket(int newfd)
+extern "C" void add_protect_socket(int newfd)
 {
 	if (newfd >= 0) {
 		_protect_socks[_protect_count++] = newfd;
@@ -817,7 +817,7 @@ static int do_channel_poll(struct channel_context *up)
 			return 1;
 		}
 
-		if (do_forward_connect(peerfd, &up->remote, "192.168.1.1:7777", &up->task) == -1) {
+		if (do_forward_connect(peerfd, &up->remote, "140.207.47.119:10014", &up->task) == -1) {
 			return 0;
 		}
 
