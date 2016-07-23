@@ -69,7 +69,7 @@ static void wait_protected_socket(tx_task_t *task)
 	_protect_req++;
 }
 
-int get_protect_socket()
+extern "C" int get_protect_socket()
 {
 	if (_protect_count > 0)
 		return _protect_socks[--_protect_count];
@@ -89,7 +89,50 @@ void check_protect_socks(void *upp)
 	return;
 }
 
-int get_socket()
+extern "C" int main_loop_stoped()
+{
+	tx_loop_t *loop = tx_loop_default();
+	return loop->tx_stop;
+}
+
+struct listen_context * txlisten_create(struct tcpip_info *info);
+extern "C" int main_loop_prepare(const char *local)
+{
+    int err;
+    struct tcpip_info info = {0};
+    static struct listen_context *upp = NULL;
+
+    tx_loop_t *loop = tx_loop_default();
+    tx_poll_t *poll = tx_epoll_init(loop);
+    tx_timer_ring *provider = tx_timer_ring_get(loop);
+
+    err = get_target_address(&info, local);
+    TX_CHECK(err == 0, "get target address failure");
+
+    tx_taskq_init(&_protect_cond);
+    tx_task_init(&_protect_task, loop, check_protect_socks, loop);
+
+	assert(upp == NULL);
+    upp = txlisten_create(&info);
+
+	return 0;
+}
+
+extern "C" int main_loop_stop()
+{
+	tx_loop_t *loop = tx_loop_default();
+	tx_loop_stop(loop);
+	return 0;
+}
+
+extern "C" int main_loop_loop()
+{
+	tx_loop_t *loop = tx_loop_default();
+	tx_loop_main(loop);
+	return loop->tx_stop;
+}
+
+extern "C" int get_socket()
 {
 	if (_protect_req <= 0
 			&& _protect_count > 5) {
@@ -965,7 +1008,7 @@ int main(int argc, char *argv[])
 	err = get_target_address(&info, argv[1]);
 	TX_CHECK(err == 0, "get target address failure");
 
-	LIST_INIT(&_protect_cond);
+	tx_taskq_init(&_protect_cond);
 	tx_task_init(&_protect_task, loop, check_protect_socks, loop);
 	upp = txlisten_create(&info);
 
@@ -987,7 +1030,7 @@ int main(int argc, char *argv[])
 	}
 
 	fprintf(stderr, "Hello World protect %d %d %d %d\n",
-			LIST_EMPTY(&_protect_cond), _protect_req, _protect_count, getdtablesize());
+			tx_taskq_empty(&_protect_cond), _protect_req, _protect_count, getdtablesize());
 	tx_loop_delete(loop);
 
 	TX_UNUSED(last_tick);
