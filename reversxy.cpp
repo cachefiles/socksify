@@ -48,8 +48,17 @@ struct relay_data {
 int _protect_req = 0;
 int _protect_count = 0;
 int _protect_socks[1024];
+int _protect_initialize = 0;
 struct tx_task_t _protect_task;
 struct tx_task_q _protect_cond;
+struct tx_task_q _stop_queue;
+
+static void on_loop_cleanup(tx_task_t *task)
+{
+	tx_loop_t *loop = tx_loop_default();
+	tx_task_record(&_stop_queue, task);
+	return;
+}
 
 static void wait_protected_socket(tx_task_t *task)
 {
@@ -95,6 +104,19 @@ extern "C" int main_loop_stoped()
 	return loop->tx_stop;
 }
 
+static long long _data_usage = 0;
+extern "C" long long main_data_usage()
+{
+	return _data_usage;
+}
+
+static struct sockaddr_in _relay0;
+void set_socksify_addr(struct sockaddr_in *relay)
+{
+	memcpy(&_relay0, relay, sizeof(_relay0));
+	return;
+}
+
 struct listen_context * txlisten_create(struct tcpip_info *info);
 extern "C" int main_loop_prepare(const char *local)
 {
@@ -109,19 +131,37 @@ extern "C" int main_loop_prepare(const char *local)
     err = get_target_address(&info, local);
     TX_CHECK(err == 0, "get target address failure");
 
-    tx_taskq_init(&_protect_cond);
-    tx_task_init(&_protect_task, loop, check_protect_socks, loop);
+	if (_protect_initialize == 0) {
+		tx_taskq_init(&_stop_queue);
+		tx_taskq_init(&_protect_cond);
+		tx_task_init(&_protect_task, loop, check_protect_socks, loop);
 
-	assert(upp == NULL);
-    upp = txlisten_create(&info);
+		assert(upp == NULL);
+		upp = txlisten_create(&info);
+		_protect_initialize = 1;
+	}
 
 	return 0;
 }
 
-extern "C" int main_loop_stop()
+extern "C" int main_loop_cleanup(void)
+{
+	for (int i = 0; i < _protect_count; i++) {
+		close(_protect_socks[i]);
+	}
+
+	_protect_req = 0;
+	_protect_count = 0;
+	tx_loop_t *loop = tx_loop_default();
+	tx_task_wakeup(&_stop_queue);
+	tx_loop_break(loop);
+	return 0;
+}
+
+extern "C" int main_loop_break()
 {
 	tx_loop_t *loop = tx_loop_default();
-	tx_loop_stop(loop);
+	tx_loop_break(loop);
 	return 0;
 }
 
@@ -190,6 +230,7 @@ int write_relay_data(struct relay_data *d, tx_aiocb *f)
 				change |= (len > 0);
 				d->off += len;
 				d->stat_total += len;
+				_data_usage += len;
 			} else if (tx_writable(f)) {
 				return 0x2;
 			}
@@ -343,6 +384,8 @@ struct channel_context {
 	tx_aiocb file;
 	tx_aiocb remote;
 	tx_task_t task;
+	tx_task_t on_stop;
+	tx_timer_t on_dead;
 
 	int port;
 	in_addr target;
@@ -357,6 +400,7 @@ static void do_channel_release(struct channel_context *up)
 {
 	int fd;
 	tx_aiocb *cb = &up->file;
+	tx_timer_stop(&up->on_dead);
 	tx_outcb_cancel(cb, 0);
 	tx_aincb_stop(cb, 0);
 
@@ -376,9 +420,17 @@ static void do_channel_release(struct channel_context *up)
 	tx_task_drop(&up->c2r.wtask);
 	tx_task_drop(&up->r2c.rtask);
 	tx_task_drop(&up->r2c.wtask);
+	tx_task_drop(&up->on_stop);
 	tx_task_drop(&up->task);
 
 	delete up;
+}
+
+static void do_channel_release_wrapper(void *up)
+{
+	struct channel_context *ctx = (struct channel_context *)up;
+	do_channel_release(ctx);
+	return;
 }
 
 static int parse_https_target(struct relay_data *d, char *host)
@@ -689,11 +741,13 @@ static int do_forward_connect(int peerfd, tx_aiocb *s, char *domain, tx_task_t *
 	struct tcpip_info info = {0};
 	tx_loop_t *loop = tx_loop_default();
 
+#if 0
 	error = get_target_address(&info, domain);
 	if (error != 0) {
 		fprintf(stderr, "failure targethost: %s\n", domain);
 		return -1;
 	}
+#endif
 
 	tx_setblockopt(peerfd, 0);
 
@@ -703,11 +757,13 @@ static int do_forward_connect(int peerfd, tx_aiocb *s, char *domain, tx_task_t *
 
 	tx_aiocb_init(s, loop, peerfd);
 
+#if 0
 	sin0.sin_family = AF_INET;
 	sin0.sin_port   = (info.port);
 	sin0.sin_addr.s_addr = (info.address);
 	fprintf(stderr, "connect to %s: %x:%d\n", domain, info.address, htons(info.port));
-	return tx_aiocb_connect(s, (struct sockaddr *)&sin0, sizeof(sin0), t);
+#endif
+	return tx_aiocb_connect(s, (struct sockaddr *)&_relay0, sizeof(_relay0), t);
 }
 
 static int do_host_connect(tx_aiocb *s, char *domain, int port, tx_task_t *t)
@@ -746,6 +802,8 @@ static int do_channel_poll(struct channel_context *up)
 {
 	int error = 0;
 	int change = 0;
+
+	tx_timer_reset(&up->on_dead, 300000);
 
 	if (up->flags & START_PROTO) {
 		if (!tx_writable(&up->remote)) {
@@ -882,11 +940,14 @@ static void do_channel_prepare(struct channel_context *up, int newfd, unsigned s
 	tx_loop_t *loop = tx_loop_default();
 
 	tx_aiocb_init(&up->file, loop, newfd);
+	tx_task_init(&up->on_stop, loop, do_channel_release_wrapper, up);
 	tx_task_init(&up->task, loop, do_channel_wrapper, up);
 	tx_task_init(&up->c2r.rtask, loop, do_channel_wrapper, up);
 	tx_task_init(&up->c2r.wtask, loop, do_channel_wrapper, up);
 	tx_task_init(&up->r2c.rtask, loop, do_channel_wrapper, up);
 	tx_task_init(&up->r2c.wtask, loop, do_channel_wrapper, up);
+	tx_timer_init(&up->on_dead, loop, &up->on_stop);
+	on_loop_cleanup(&up->on_stop);
 
 	up->port = port;
 	up->domain[0] = 0;
