@@ -183,6 +183,15 @@ extern "C" int get_socket()
 	return socket(AF_INET, SOCK_STREAM, 0);
 }
 
+extern "C" void drop_protect_socket(void)
+{
+	for (int i = 0; i < _protect_count; i++) {
+		close(_protect_socks[i]);
+	}
+	_protect_count = 0;
+	return;
+}
+
 extern "C" void add_protect_socket(int newfd)
 {
 	if (newfd >= 0) {
