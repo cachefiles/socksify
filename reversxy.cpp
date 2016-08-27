@@ -89,7 +89,7 @@ void check_protect_socks(void *upp)
 {
 	tx_loop_t *loop = tx_loop_default();
 
-	if (!LIST_EMPTY(&_protect_cond)
+	if (!tx_taskq_empty(&_protect_cond)
 			&& _protect_count < 1024) {
 		tx_task_active(&_protect_task);
 		tx_loop_break(loop);
@@ -146,15 +146,22 @@ extern "C" int main_loop_prepare(const char *local)
 
 extern "C" int main_loop_cleanup(void)
 {
+	tx_loop_t *loop = tx_loop_default();
+
+	_protect_count = 0;
+	_protect_req = 0;
 	for (int i = 0; i < _protect_count; i++) {
 		close(_protect_socks[i]);
 	}
 
-	_protect_req = 0;
-	_protect_count = 0;
-	tx_loop_t *loop = tx_loop_default();
+	tx_task_drop(&_protect_task);
 	tx_task_wakeup(&_stop_queue);
 	tx_loop_break(loop);
+
+	if (!tx_taskq_empty(&_protect_cond)) {
+		abort();
+	}
+
 	return 0;
 }
 
@@ -196,8 +203,8 @@ extern "C" void add_protect_socket(int newfd)
 {
 	if (newfd >= 0) {
 		_protect_socks[_protect_count++] = newfd;
-		tx_task_wakeup(&_protect_cond);
 		if (_protect_req > 0) _protect_req--;
+		tx_task_wakeup(&_protect_cond);
 	}
 
 	return;
@@ -227,7 +234,7 @@ int fill_relay_data(struct relay_data *d, tx_aiocb *f)
 	return change;
 }
 
-int write_relay_data(struct relay_data *d, tx_aiocb *f)
+int write_relay_data(struct relay_data *d, tx_aiocb *f, int ismobile)
 {
 	int len;
 	int change = 0;
@@ -239,7 +246,7 @@ int write_relay_data(struct relay_data *d, tx_aiocb *f)
 				change |= (len > 0);
 				d->off += len;
 				d->stat_total += len;
-				_data_usage += len;
+				if (ismobile) _data_usage += len;
 			} else if (tx_writable(f)) {
 				return 0x2;
 			}
@@ -390,6 +397,7 @@ static int check_proxy_proto(struct relay_data *d)
 struct channel_context {
 	int flags;
 	int pxy_stat;
+	int is_mobile;
 	tx_aiocb file;
 	tx_aiocb remote;
 	tx_task_t task;
@@ -888,6 +896,14 @@ static int do_channel_poll(struct channel_context *up)
 			return 0;
 		}
 
+		socklen_t locallen;
+		struct sockaddr_in localname;
+		locallen = sizeof(localname);
+		int err = getsockname(peerfd, (struct sockaddr *)&localname, &locallen);
+		if (err == 0) {
+			up->is_mobile = ((localname.sin_addr.s_addr & htonl(0xff000000)) == htonl(0x0a000000));
+		}		
+
 		up->flags |= (START_PROTO| DIRECT_PROTO);
 		up->flags &= ~FORWARD_PROTO;
 		return 1;
@@ -901,14 +917,14 @@ static int do_channel_poll(struct channel_context *up)
 	do {
 		change = fill_relay_data(&up->c2r, &up->file);
 		if (change & 0x02) return 0;
-		change |= write_relay_data(&up->c2r, &up->remote);
+		change |= write_relay_data(&up->c2r, &up->remote, up->is_mobile);
 		if (change & 0x02) return 0;
 	} while (change);
 
 	do {
 		change = fill_relay_data(&up->r2c, &up->remote);
 		if (change & 0x02) return 0;
-		change |= write_relay_data(&up->r2c, &up->file);
+		change |= write_relay_data(&up->r2c, &up->file, up->is_mobile);
 		if (change & 0x02) return 0;
 	} while (change);
 
@@ -957,6 +973,7 @@ static void do_channel_prepare(struct channel_context *up, int newfd, unsigned s
 	tx_task_init(&up->r2c.wtask, loop, do_channel_wrapper, up);
 	tx_timer_init(&up->on_dead, loop, &up->on_stop);
 	on_loop_cleanup(&up->on_stop);
+	up->is_mobile = 1;
 
 	up->port = port;
 	up->domain[0] = 0;
@@ -1099,8 +1116,10 @@ int main(int argc, char *argv[])
 		} while (fd != -1);
 	}
 
+#if 0
 	fprintf(stderr, "Hello World protect %d %d %d %d\n",
 			tx_taskq_empty(&_protect_cond), _protect_req, _protect_count, getdtablesize());
+#endif
 	tx_loop_delete(loop);
 
 	TX_UNUSED(last_tick);
