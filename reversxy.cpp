@@ -20,6 +20,7 @@
 #define SD_BOTH SHUT_RDWR
 #endif
 
+#define USE_JUST_FORWARD
 #define STDIN_FILE_FD 0
 #define FAILURE_SAFEEXIT(cond, fmt, args...) do { if ((cond) == 0) break; fprintf(stderr, fmt, args); exit(0); } while ( 0 )
 
@@ -221,6 +222,10 @@ int fill_relay_data(struct relay_data *d, tx_aiocb *f)
 			d->len < (int)sizeof(d->buf) && !d->flag) {
 		len = recv(f->tx_fd, d->buf + d->len, sizeof(d->buf) - d->len, 0);
 		tx_aincb_update(f, len);
+#if 0
+		for (int i = 0; i < len; i++)
+			d->buf[d->len + i] ^= 0x5a;
+#endif
 
 		change |= (len > 0);
 		if (len > 0)
@@ -815,6 +820,8 @@ static int do_host_connect(tx_aiocb *s, char *domain, int port, tx_task_t *t)
 	return tx_aiocb_connect(s, (struct sockaddr *)&sin0, sizeof(sin0), t);
 }
 
+static struct tcpip_info _remote_target = {0};
+
 static int do_channel_poll(struct channel_context *up)
 {
 	int error = 0;
@@ -886,13 +893,30 @@ static int do_channel_poll(struct channel_context *up)
 	}
 
 	if (FORWARD_PROTO & up->flags) {
+		struct sockaddr_in sin0;
 		int peerfd = get_protect_socket();
+
 		if (peerfd == -1) {
 			wait_protected_socket(&up->task);
 			return 1;
 		}
 
-		if (do_forward_connect(peerfd, &up->remote, "140.207.47.119:10014", &up->task) == -1) {
+
+		tx_setblockopt(peerfd, 0);
+
+		memset(&sin0, 0, sizeof(sin0));
+		sin0.sin_family = AF_INET;
+		error = bind(peerfd, (struct sockaddr *)&sin0, sizeof(sin0));
+
+		tx_loop_t *loop = tx_loop_default();
+		tx_aiocb_init(&up->remote, loop, peerfd);
+
+		sin0.sin_family = AF_INET;
+		sin0.sin_port   = _remote_target.port;
+		sin0.sin_addr.s_addr = _remote_target.address;
+
+		if (tx_aiocb_connect(&up->remote,
+					(struct sockaddr *)&sin0, sizeof(sin0), &up->task) == -1) {
 			return 0;
 		}
 
@@ -1076,7 +1100,7 @@ struct listen_context * txlisten_create(struct tcpip_info *info)
 
 int main(int argc, char *argv[])
 {
-	int err;
+	int i, err, bind_ok = 0;
 	struct tcpip_info info = {0};
 	struct listen_context *upp;
 	unsigned int last_tick = 0;
@@ -1092,8 +1116,38 @@ int main(int argc, char *argv[])
 	TX_CHECK(provider1 == provider, "timer provider not equal");
 	TX_CHECK(provider2 == provider, "timer provider not equal");
 
-	err = get_target_address(&info, argv[1]);
-	TX_CHECK(err == 0, "get target address failure");
+	for (i = 1; i < argc; i++) {
+		if (strncmp(argv[i], "-l", 2) == 0) {
+			const char *bind_info = &argv[i][3];
+			if (*bind_info == 0) {
+				TX_CHECK(i + 1 < argc, "missing bind argument info");
+				bind_info = argv[++i];
+			} else if (*bind_info == '=') {
+				TX_CHECK(i + 1 < argc, "missing argument");
+				bind_info++;
+			}
+
+			err = get_target_address(&info, bind_info);
+			TX_CHECK(err == 0, "get target address failure");
+			bind_ok = 1;
+		} else if (strncmp(argv[i], "-h", 2) == 0) {
+			fprintf(stderr, "%s [-h] [-l bind_info] <target>\n", argv[0]);
+			fprintf(stderr, "\t-l bind_info bind listen address to bind_info format <host:port>\n");
+			fprintf(stderr, "\t<target> connect target\n");
+			fprintf(stderr, "\t-h print this help\n");
+			fprintf(stderr, "\n");
+			exit(0);
+		} else if (*argv[i] == '-') {
+			fprintf(stderr, "unkown option: %s\n", argv[i]);
+			exit(0);
+		} else {
+			err = get_target_address(&_remote_target, argv[i]);
+			TX_CHECK(err == 0, "get target address failure");
+		}
+	}
+
+	TX_CHECK(bind_ok == 1, "get target address failure");
+	if (bind_ok == 0) exit(0);
 
 	tx_taskq_init(&_protect_cond);
 	tx_task_init(&_protect_task, loop, check_protect_socks, loop);
