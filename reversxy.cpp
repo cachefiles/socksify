@@ -9,6 +9,7 @@
 #include <netdb.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <signal.h>
 #endif
 
 #include "txall.h"
@@ -20,12 +21,13 @@
 #define SD_BOTH SHUT_RDWR
 #endif
 
-#define USE_JUST_FORWARD
+// #define USE_JUST_FORWARD
 #define STDIN_FILE_FD 0
 #define FAILURE_SAFEEXIT(cond, fmt, args...) do { if ((cond) == 0) break; fprintf(stderr, fmt, args); exit(0); } while ( 0 )
 
 struct listen_context {
     int flags;
+	int just_forward;
     unsigned int port;
 
     tx_aiocb file;
@@ -56,7 +58,6 @@ struct tx_task_q _stop_queue;
 
 static void on_loop_cleanup(tx_task_t *task)
 {
-	tx_loop_t *loop = tx_loop_default();
 	tx_task_record(&_stop_queue, task);
 	return;
 }
@@ -112,6 +113,7 @@ extern "C" long long main_data_usage()
 }
 
 static struct sockaddr_in _relay0;
+
 void set_socksify_addr(struct sockaddr_in *relay)
 {
 	memcpy(&_relay0, relay, sizeof(_relay0));
@@ -128,6 +130,8 @@ extern "C" int main_loop_prepare(const char *local)
     tx_loop_t *loop = tx_loop_default();
     tx_poll_t *poll = tx_epoll_init(loop);
     tx_timer_ring *provider = tx_timer_ring_get(loop);
+	TX_UNUSED(provider);
+	TX_UNUSED(poll);
 
     err = get_target_address(&info, local);
     TX_CHECK(err == 0, "get target address failure");
@@ -222,10 +226,6 @@ int fill_relay_data(struct relay_data *d, tx_aiocb *f)
 			d->len < (int)sizeof(d->buf) && !d->flag) {
 		len = recv(f->tx_fd, d->buf + d->len, sizeof(d->buf) - d->len, 0);
 		tx_aincb_update(f, len);
-#if 0
-		for (int i = 0; i < len; i++)
-			d->buf[d->len + i] ^= 0x5a;
-#endif
 
 		change |= (len > 0);
 		if (len > 0)
@@ -275,6 +275,27 @@ int try_shutdown_relay(struct relay_data *d, tx_aiocb *f)
 	return 0;
 }
 
+struct channel_context {
+	int flags;
+	int pxy_stat;
+	int is_mobile;
+	tx_aiocb file;
+	tx_aiocb remote;
+	tx_task_t task;
+	tx_task_t on_stop;
+	tx_timer_t on_dead;
+
+	int port;
+	in_addr target;
+	char domain[128];
+	int (*proxy_handshake)(struct channel_context *up);
+
+	struct relay_data c2r;
+	struct relay_data r2c;
+};
+
+struct channel_context *_dbg_ctx = NULL;
+
 int relay_fill_prepare(struct relay_data *d, tx_aiocb *f)
 {
 	int error = 0;
@@ -284,7 +305,7 @@ int relay_fill_prepare(struct relay_data *d, tx_aiocb *f)
 		tx_aincb_active(f, &d->rtask);
 		error = 1;
 	} else {
-		printf("fallback %x %d %d\n", d->flag, tx_readable(f), d->len);
+		printf("fallback %x %d %d: %s\n", d->flag, tx_readable(f), d->len, _dbg_ctx? _dbg_ctx->domain: "");
 	}
 
 	return error;
@@ -381,7 +402,7 @@ static int check_proxy_proto(struct relay_data *d)
 		}
 	}
 
-	if (!buf_overflow(&m)) {
+	if (!buf_overflow(&m) && d->len > 0) {
 		flags |= UNKOWN_PROTO;
 		return flags;
 	}
@@ -399,24 +420,6 @@ static int check_proxy_proto(struct relay_data *d)
 	return 0;
 }
 
-struct channel_context {
-	int flags;
-	int pxy_stat;
-	int is_mobile;
-	tx_aiocb file;
-	tx_aiocb remote;
-	tx_task_t task;
-	tx_task_t on_stop;
-	tx_timer_t on_dead;
-
-	int port;
-	in_addr target;
-	char domain[128];
-	int (*proxy_handshake)(struct channel_context *up);
-
-	struct relay_data c2r;
-	struct relay_data r2c;
-};
 
 static void do_channel_release(struct channel_context *up)
 {
@@ -459,28 +462,6 @@ static int parse_https_target(struct relay_data *d, char *host)
 {
 	char buf[128];
 	sscanf(d->buf, "CONNECT %s", buf);
-	fprintf(stderr, "https target %s\n", buf);
-
-	const char *_https_map[] = {
-		"openapi.youku.com",
-		"61.135.196.99",
-		"220.181.185.150",
-		"111.13.127.46",
-		"211.151.50.10",
-		"123.126.99.57",
-		"123.126.99.39",
-		"220.181.154.137",
-		"httpbin.org",
-		NULL
-	};
-
-	for (int i = 0; _https_map[i]; i++) {
-		if (strcmp(_https_map[i], buf) == 0) {
-			strcpy(host, "@");
-			strcat(host, buf);
-			return 0;
-		}
-	}
 
 	strcpy(host, buf);
 	return 0;
@@ -489,106 +470,14 @@ static int parse_https_target(struct relay_data *d, char *host)
 #define N 10
 #define DEBUG(msg, ...)
 
-static int is_ipcheck_url(const char *host, const char *fulluri, const char *regex)
-{
-	int insub;
-	regex_t reg;
-	regmatch_t pm[N];
-
-	const char *di;
-	char *sp, sub_regex[512];
-
-	sp = sub_regex;
-	insub = 0;
-
-	di = strchr(fulluri, '/');
-	if (di != NULL) fulluri = di;
-
-	for (const char *p = regex; *p; p++) {
-		if (insub == 0 && *p != '/') {
-			DEBUG("ignore char %c\n", *p);
-			continue;
-		}
-
-		if (insub == 0 && *p == '/') {
-			insub = 1;
-			continue;
-		}
-
-		if (*p == '\\' && *p != 0) {
-			*sp++ = *p++;
-			*sp++ = *p;
-			continue;
-		}
-
-		if (*p != ',') {
-			*sp++ = *p;
-			continue;
-		}
-
-		*sp = 0;
-		if (sp > (sub_regex + 2) &&
-				*(sp - 1) == 'i' && *(sp - 2) == '/') {
-			*(sp - 2) = 0;
-		}
-
-		DEBUG("regex is: %s\n", sub_regex);
-		int z = REG_NOMATCH;
-		int error = regcomp(&reg, sub_regex + 1, REG_EXTENDED|REG_NOSUB|REG_NOTEOL);
-		if (0 == error) {
-			z = regexec(&reg, fulluri, N, pm, REG_NOTBOL);
-			regfree(&reg);
-		} else {
-			fprintf(stderr, "regex %d failure: %s\n", error, sub_regex);
-		}
-
-		if (z != REG_NOMATCH) {
-			fprintf(stderr, "regex is match: %s %s %s\n", host, fulluri, regex);
-			return 1;
-		}
-
-		sp = sub_regex;
-		insub = 0;
-	}
-
-	if (insub) {
-		*sp = 0;
-		if (sp > (sub_regex + 2) &&
-				*(sp - 1) == 'i' && *(sp - 2) == '/') {
-			*(sp - 2) = 0;
-		}
-
-		DEBUG("regex is: %s\n", sub_regex);
-		int z = REG_NOMATCH;
-		int error = regcomp(&reg, sub_regex + 1, REG_EXTENDED|REG_NOSUB|REG_NOTEOL|REG_NOTBOL);
-		if (0 == error) {
-			z = regexec(&reg, fulluri, N, pm, REG_NOTBOL);
-			regfree(&reg);
-		} else {
-			fprintf(stderr, "regex %d failure: %s\n", error, sub_regex);
-		}
-
-		if (z != REG_NOMATCH) {
-			fprintf(stderr, "regex is match: %s %s %s\n", host, fulluri, regex);
-			return 1;
-		}
-
-		sp = sub_regex;
-		insub = 0;
-	}
-
-	fprintf(stderr, "regex not match: %s %s %s\n", host, fulluri, regex);
-	return 0;
-}
-
 static int parse_http_target(struct relay_data *d, char *host)
 {
 	char *p, *delter;
 	char uri[512], method[16], ver[16];
 	sscanf(d->buf, "%s %s %s", method, uri, ver);
 
-	if (memmem(d->buf, d->len, "\r\n\r\n", 4) == NULL &&
-			(memcmp(uri, "http://", 7) && memcmp(uri, "https://", 8) || memmem(d->buf, d->len, "\r\n", 2) == NULL)) {
+	if ((memmem(d->buf, d->len, "\r\n\r\n", 4) == NULL) &&
+			((memcmp(uri, "http://", 7) && memcmp(uri, "https://", 8)) || (memmem(d->buf, d->len, "\r\n", 2) == NULL))) {
 		fprintf(stderr, "request not finish: ##|%s|## %d %s %s %s\n", d->buf, d->len, method, uri, ver);
 		return 1;
 	}
@@ -615,176 +504,55 @@ static int parse_http_target(struct relay_data *d, char *host)
 		strcpy(host, delter);
 	}
 
-	const char *any = "/^[^/]*\\.dpool\\.sina\\.com\\.cn\\/iplookup/i, /^[^/]*/vrs_flash\\.action/i";
-	const char *list[] = {
-		"v.youku.com","/^\\/player\\//i",
-		"api.youku.com","/^\\/player\\//i",
-		"play.youku.com","/^\\/play\\/get\\.json/i",
-		"v2.tudou.com","/^\\//i",
-		"www.tudou.com","/^\\/a\\//i,/^\\/v\\//i,/^\\/outplay\\/goto\\/getTvcCode/i,/^\\/tvp\\/alist\\.action/i",
-		"s.plcloud.music.qq.com","/^\\/fcgi\\-bin\\/p\\.fcg/i",
-		"i.y.qq.com","/^\\/s\\.plcloud\\/fcgi\\-bin\\/p\\.fcg/i",
-		"hot.vrs.sohu.com","/^\\//i",
-		"live.tv.sohu.com","/^\\/live\\/player/i",
-		"pad.tv.sohu.com","/^\\/playinfo/i",
-		"my.tv.sohu.com","/^\\/play\\/m3u8version\\.do/i",
-		"hot.vrs.letv.com","/^\\//i",
-		"data.video.qiyi.com","/^\\/v\\./i,/^\\/videos\\//i,/^\\/.*\\/videos\\//i",
-		"cache.video.qiyi.com","/^\\/vms\\?/i,/^\\/vp\\/.*\\/.*\\/\\?src=/i,/^\\/vps\\?/i,/^\\/liven\\//i",
-		"cache.vip.qiyi.com","/^\\/vms\\?/i",
-		"v.api.hunantv.com","/^\\/player\\/video/i",
-		"vv.video.qq.com","/^\\//i,/^\\/getvinfo/i,/^\\/getinfo/i,/^\\/geturl/i",
-		"tt.video.qq.com","/^\\/getvinfo/i",
-		"ice.video.qq.com","/^\\/getvinfo/i",
-		"tjsa.video.qq.com","/^\\/getvinfo/i",
-		"a10.video.qq.com","/^\\/getvinfo/i",
-		"xyy.video.qq.com","/^\\/getvinfo/i",
-		"vcq.video.qq.com","/^\\/getvinfo/i",
-		"vsh.video.qq.com","/^\\/getvinfo/i",
-		"vbj.video.qq.com","/^\\/getvinfo/i",
-		"bobo.video.qq.com","/^\\/getvinfo/i",
-		"flvs.video.qq.com","/^\\/getvinfo/i",
-		"bkvv.video.qq.com","/^\\/getvinfo/i",
-		"info.zb.qq.com","/^\\/\\?/i",
-		"geo.js.kankan.xunlei.com","/^\\//i",
-		"web-play.pptv.com","/^\\//i",
-		"web-play.pplive.cn","/^\\//i",
-		"dyn.ugc.pps.tv","/^\\//i",
-		"v.pps.tv","/^\\/ugc\\/ajax\\/aj_html5_url\\.php/i",
-		"inner.kandian.com","/^\\//i",
-		"ipservice.163.com","/^\\//i",
-		"so.open.163.com","/^\\/open\\/info\\.htm/i",
-		"zb.s.qq.com","/^\\//i",
-		"ip.kankan.xunlei.com","/^\\//i",
-		"vxml.56.com","/^\\/json\\//i",
-		"music.sina.com.cn","/^\\/yueku\\/intro\\//i,/^\\/radio\\/port\\/webFeatureRadioLimitList\\.php/i",
-		"play.baidu.com","/^\\/data\\/music\\/songlink/i",
-		"v.iask.com","/^\\/v_play\\.php/i,/^\\/v_play_ipad\\.cx\\.php/i",
-		"tv.weibo.com","/^\\/player\\//i",
-		"wtv.v.iask.com","/^\\/.*\\.m3u8/i,/^\\/mcdn\\.php$/i,/^\\/player\\/ovs1_idc_list\\.php/i",
-		"video.sina.com.cn","/^\\/interface\\/l\\/u\\/getFocusStatus\\.php/i",
-		"www.yinyuetai.com","/^\\/insite\\//i,/^\\/main\\/get\\-/i",
-		"api.letv.com","/^\\/streamblock/i,/^\\/mms\\/out\\/video\\/play/i,/^\\/mms\\/out\\/common\\/geturl/i,/^\\/geturl/i,/^\\/api\\/geturl/i,/^\\/getipgeo$/i",
-		"st.live.letv.com","/^\\/live\\//i",
-		"live.gslb.letv.com","/^\\/gslb\\?/i",
-		"static.itv.letv.com","/^\\/api/i",
-		"ip.apps.cntv.cn","/^\\/js\\/player\\.do/i",
-		"vdn.apps.cntv.cn","/^\\/api\\/get/i,/^\\/api\\/getLiveUrlCommonApi\\.do\\?pa:\\/\\/cctv_p2p_hdcctv5/i,/^\\/api\\/getLiveUrlCommonApi\\.do\\?pa:\\/\\/cctv_p2p_hdcctv6/i,/^\\/api\\/getLiveUrlCommonApi\\.do\\?pa:\\/\\/cctv_p2p_hdcctv8/i,/^\\/api\\/getLiveUrlCommonApi\\.do\\?pa:\\/\\/cctv_p2p_hdbtv6/i",
-		"vdn.live.cntv.cn","/^\\/api2\\/liveHtml5\\.do\\?channel=pa:\\/\\/cctv_p2p_hdcctv5/i,/^\\/api2\\/liveHtml5\\.do\\?channel=pa:\\/\\/cctv_p2p_hdcctv6/i,/^\\/api2\\/liveHtml5\\.do\\?channel=pa:\\/\\/cctv_p2p_hdcctv8/i,/^\\/api2\\/liveHtml5\\.do\\?channel=pa:\\/\\/cctv_p2p_hdbtv6/i,/^\\/api2\\/live\\.do\\?channel=pa:\\/\\/cctv_p2p_hdcctv5/i,/^\\/api2\\/live\\.do\\?channel=pa:\\/\\/cctv_p2p_hdcctv6/i,/^\\/api2\\/live\\.do\\?channel=pa:\\/\\/cctv_p2p_hdcctv8/i,/^\\/api2\\/live\\.do\\?channel=pa:\\/\\/cctv_p2p_hdbtv6/i",
-		"vip.sports.cntv.cn","/^\\/check\\.do/i,/^\\/play\\.do/i,/^\\/servlets\\/encryptvideopath\\.do/i",
-		"211.151.157.15","/^\\//i",
-		"a.play.api.3g.youku.com","/^\\/common\\/v3\\/play\\?/i",
-		"i.play.api.3g.youku.com","/^\\/common\\/v3\\/play\\?/i,/^\\/common\\/v3\\/hasadv\\/play\\?/i",
-		"api.3g.youku.com","/^\\/layout/i,/^\\/v3\\/play\\/address/i,/^\\/openapi\\-wireless\\/videos\\/.*\\/download/i,/^\\/videos\\/.*\\/download/i,/^\\/common\\/v3\\/play/i",
-		"tv.api.3g.youku.com","/^\\/openapi\\-wireless\\/v3\\/play\\/address/i,/^\\/common\\/v3\\/hasadv\\/play/i,/^\\/common\\/v3\\/play/i",
-		"play.api.3g.youku.com","/^\\/common\\/v3\\/hasadv\\/play/i,/^\\/common\\/v3\\/play/i,/^\\/v3\\/play\\/address/i",
-		"play.api.3g.tudou.com","/^\\/v/i",
-		"tv.api.3g.tudou.com","/^\\/tv\\/play\\?/i",
-		"api.3g.tudou.com","/^\\//i",
-		"api.tv.sohu.com","/^\\/mobile_user\\/device\\/clientconf\\.json\\?/i",
-		"access.tv.sohu.com","/^\\//i",
-		"iface.iqiyi.com","/^\\/api\\/searchIface\\?/i",
-		"iface2.iqiyi.com","/^\\/php\\/xyz\\/iface\\//i,/^\\/php\\/xyz\\/entry\\/galaxy\\.php\\?/i,/^\\/php\\/xyz\\/entry\\/nebula\\.php\\?/i",
-		"cache.m.iqiyi.com","/^\\/jp\\/tmts\\//i",
-		"dynamic.app.m.letv.com","/^\\/.*\\/dynamic\\.php\\?.*ctl=videofile/i",
-		"dynamic.meizi.app.m.letv.com","/^\\/.*\\/dynamic\\.php\\?.*ctl=videofile/i",
-		"dynamic.search.app.m.letv.com","/^\\/.*\\/dynamic\\.php\\?.*ctl=videofile/i",
-		"dynamic.live.app.m.letv.com","/^\\/.*\\/dynamic\\.php\\?.*act=canplay/i",
-		"listso.m.areainfo.ppstream.com","/^\\/ip\\/q\\.php/i",
-		"epg.api.pptv.com","/^\\/detail\\.api\\?/i",
-		"play.api.pptv.com","/^\\/boxplay\\.api\\?/i",
-		"m.letv.com","/^\\/api\\/geturl\\?/i",
-		"api.mob.app.letv.com","/^\\/play/i",
-		"interface.bilibili.com","/^\\/playurl\\?/i",
-		"3g.music.qq.com","/^\\//i",
-		"mqqplayer.3g.qq.com","/^\\//i",
-		"proxy.music.qq.com","/^\\//i",
-		"proxymc.qq.com","/^\\//i",
-		"ip2.kugou.com","/^\\/check\\/isCn\\//i",
-		"ip.kugou.com","/^\\/check\\/isCn\\//i",
-		"client.api.ttpod.com","/^\\/global/i",
-		"mobi.kuwo.cn","/^\\//i",
-		"mobilefeedback.kugou.com","/^\\//i",
-		"tingapi.ting.baidu.com","/^\\/v1\\/restserver\\/ting\\?.*method=baidu\\.ting\\.song/i",
-		"music.baidu.com","/^\\/data\\/music\\/links\\?/i",
-		"serviceinfo.sdk.duomi.com","/^\\/api\\/serviceinfo\\/getserverlist/i",
-		"music.163.com","/^\\/api\\/copyright\\/restrict\\/\\?/i,/^\\/api\\/batch$/i",
-		"www.xiami.com","/^\\/web\\/spark/i,/^\\/web\\/.*\\?.*xiamitoken=/i",
-		"spark.api.xiami.com","/^\\/api\\?.*method=AuthIp/i,/^\\/api\\?.*method=Start\\.init/i,/^\\/api\\?.*method=Songs\\.getTrackDetail/i,/^\\/api\\?.*method=Songs\\.detail/i",
-		"iplocation.geo.qiyi.com","/^\\/cityjson$/i",
-		"sns.video.qq.com","/^\\/tunnel\\/fcgi\\-bin\\/tunnel/i",
-		"v5.pc.duomi.com","/^\\/single\\-ajaxsingle\\-isban/i",
-		"tms.is.ysten.com","/^:8080\\/yst\\-tms\\/login\\.action\\?/i",
-		"chrome.2345.com","/^\\/dianhua\\/mobileApi\\/check\\.php$/i",
-		"internal.check.duokanbox.com","/^\\/check\\.json/i",
-
-		"180.153.225.136", "/^\\//i",
-		"118.244.244.124", "/^\\//i",
-		"210.129.145.150", "/^\\//i",
-		"182.16.230.98", "/^\\//i"
-	};
-
-	char all_regex_list[1024];
-	strcpy(all_regex_list, any);
-
-	for (int i = 0; i < sizeof(list)/sizeof(list[0]); i++) {
-		if (strcmp(list[i], host) == 0) {
-			strcat(all_regex_list, ", ");
-			strcat(all_regex_list, list[i + 1]);
-			break;
-		}
-
-		i++;
-	}
-
-	if (is_ipcheck_url(host, delter, all_regex_list)) {
-		char *p;
-		char savehost[128], followlines[4096];
-		strcpy(savehost, host);
-		sprintf(host, "@%s", savehost);
-
-		p = (char *)memmem(d->buf, d->len, "\r\n", 2);
+	p = (char *)memmem(d->buf, d->len, "\r\n", 2);
+	if (p != NULL) {
+		char *line_limit = p;
+		p = (char *)memmem(d->buf, line_limit - d->buf, " http://", 8);
 		if (p != NULL) {
-			memcpy(followlines, p, d->buf + d->len - p);
-			followlines[d->buf + d->len - p] = 0;
-			d->len = sprintf(d->buf, "%s %s %s%s", method, uri, ver, followlines);
-			fprintf(stderr, "rebuild data ###[%s]##\n", d->buf);
+			char *next = (char *)memmem(p + 8, line_limit - p - 8, "/", 1);
+			if (next == NULL) {
+				next = (char *)memmem(p + 8, line_limit - p - 8, " ", 1);
+				if (next) { next = next -1; *next = '/'; }
+			}
+
+			if (next != NULL) {
+				char *limit = d->buf + d->len;
+				memmove(p + 1, next, limit - next);
+				d->len -= (next - p - 1);
+			}
 		}
 	}
 
-	//fprintf(stderr, "http target %s, method %s\n", buf, method);
 	return 0;
 }
 
 static int do_forward_connect(int peerfd, tx_aiocb *s, char *domain, tx_task_t *t)
 {
-	int error = -1;
-	struct sockaddr_in sin0;
-	struct tcpip_info info = {0};
+	int error;
+	struct sockaddr_in sin0 = {};
 	tx_loop_t *loop = tx_loop_default();
 
 #if 0
+	struct tcpip_info info = {0};
+	struct sockaddr_in sin1 = {};
 	error = get_target_address(&info, domain);
 	if (error != 0) {
 		fprintf(stderr, "failure targethost: %s\n", domain);
 		return -1;
 	}
-#endif
 
-	tx_setblockopt(peerfd, 0);
-
-	memset(&sin0, 0, sizeof(sin0));
-	sin0.sin_family = AF_INET;
-	error = bind(peerfd, (struct sockaddr *)&sin0, sizeof(sin0));
-
-	tx_aiocb_init(s, loop, peerfd);
-
-#if 0
-	sin0.sin_family = AF_INET;
-	sin0.sin_port   = (info.port);
-	sin0.sin_addr.s_addr = (info.address);
+	sin1.sin_family = AF_INET;
+	sin1.sin_port   = (info.port);
+	sin1.sin_addr.s_addr = (info.address);
 	fprintf(stderr, "connect to %s: %x:%d\n", domain, info.address, htons(info.port));
 #endif
+
+	sin0.sin_family = AF_INET;
+	error = bind(peerfd, (struct sockaddr *)&sin0, sizeof(sin0));
+	TX_CHECK(error == 0, "bind failure");
+
+	tx_setblockopt(peerfd, 0);
+	tx_aiocb_init(s, loop, peerfd);
 	return tx_aiocb_connect(s, (struct sockaddr *)&_relay0, sizeof(_relay0), t);
 }
 
@@ -796,7 +564,6 @@ static int do_host_connect(tx_aiocb *s, char *domain, int port, tx_task_t *t)
 	tx_loop_t *loop = tx_loop_default();
 
 	info.port = htons(port);
-	if (*domain == '@') domain = "proxy.uku.im:443";
 	error = get_target_address(&info, domain);
 	if (error != 0) {
 		fprintf(stderr, "failure targethost: %s\n", domain);
@@ -816,8 +583,10 @@ static int do_host_connect(tx_aiocb *s, char *domain, int port, tx_task_t *t)
 	sin0.sin_family = AF_INET;
 	sin0.sin_port   = (info.port);
 	sin0.sin_addr.s_addr = (info.address);
-	fprintf(stderr, "connect to %s: %x:%d\n", domain, info.address, htons(info.port));
-	return tx_aiocb_connect(s, (struct sockaddr *)&sin0, sizeof(sin0), t);
+	error = tx_aiocb_connect(s, (struct sockaddr *)&sin0, sizeof(sin0), t);
+
+	fprintf(stderr, "connect to %s: %x:%d %d\n", domain, info.address, htons(info.port), error);
+	return error;
 }
 
 static struct tcpip_info _remote_target = {0};
@@ -829,6 +598,7 @@ static int do_channel_poll(struct channel_context *up)
 
 	tx_timer_reset(&up->on_dead, 300000);
 
+	_dbg_ctx = up;
 	if (up->flags & START_PROTO) {
 		if (!tx_writable(&up->remote)) {
 			return 1;
@@ -843,7 +613,8 @@ static int do_channel_poll(struct channel_context *up)
 		up->flags |= check_proxy_proto(&up->c2r);
 		if (NONE_PROTO == (up->flags & SUPPORTED_PROTO)) {
 			int prep = relay_fill_prepare(&up->c2r, &up->file);
-			fprintf(stderr, "%p proto detected return : %x \n", up, prep);
+			if (prep == 0) fprintf(stderr, "%p proto detected return : %x %x %d %d %d\n",
+					up, prep, up->flags, up->c2r.len, up->c2r.flag & RDF_EOF, change);
 			return prep;
 		}
 
@@ -857,8 +628,9 @@ static int do_channel_poll(struct channel_context *up)
 			return relay_fill_prepare(&up->c2r, &up->file);
 		}
 
+		strcpy(up->domain, targethost);
 		if (do_host_connect(&up->remote, targethost, 443, &up->task) == -1) {
-			fprintf(stderr,  "xxtargethost: %s\n", targethost);
+			fprintf(stderr,  "https target: %s\n", targethost);
 			return 0;
 		}
 
@@ -881,12 +653,13 @@ static int do_channel_poll(struct channel_context *up)
 			return relay_fill_prepare(&up->c2r, &up->file);
 		}
 
+		strcpy(up->domain, targethost);
 		if (do_host_connect(&up->remote, targethost, 80, &up->task) == -1) {
-			fprintf(stderr,  "xxtargethost: %s\n", targethost);
+			fprintf(stderr,  "http target: %s\n", targethost);
 			return 0;
 		}
 	
-		fprintf(stderr, "targethost: %s\n", targethost);
+		fprintf(stderr, "http target: %s\n", targethost);
 		up->flags |= (START_PROTO| DIRECT_PROTO);
 		up->flags &= ~HTTP_PROTO;
 		return 1;
@@ -934,7 +707,8 @@ static int do_channel_poll(struct channel_context *up)
 	}
 
 	if (DIRECT_PROTO != (up->flags & DIRECT_PROTO)) {
-		fprintf(stderr, "proto handle error: %x \n", up->flags);
+		up->c2r.buf[up->c2r.len] = 0;
+		fprintf(stderr, "proto handle error: %x %x %d %s\n", up->flags, up->c2r.flag, up->c2r.len, up->c2r.buf);
 		return 0;
 	}
 
@@ -972,6 +746,7 @@ static void do_channel_wrapper(void *up)
 	upp = (struct channel_context *)up;
 	err = do_channel_poll(upp);
 
+	_dbg_ctx = 0;
 	if (err == 0) {
 		fprintf(stderr, "channel release %d %d\n", upp->c2r.stat_total, upp->r2c.stat_total);
 		do_channel_release(upp);
@@ -983,9 +758,6 @@ static void do_channel_wrapper(void *up)
 
 static void do_channel_prepare(struct channel_context *up, int newfd, unsigned short port)
 {
-	int peerfd, error;
-	struct sockaddr sa0;
-	struct sockaddr_in sin0;
 	tx_loop_t *loop = tx_loop_default();
 
 	tx_aiocb_init(&up->file, loop, newfd);
@@ -1003,33 +775,15 @@ static void do_channel_prepare(struct channel_context *up, int newfd, unsigned s
 	up->domain[0] = 0;
 	tx_setblockopt(newfd, 0);
 
-#if 0
-	peerfd = socket(AF_INET, SOCK_STREAM, 0);
-
-	memset(&sa0, 0, sizeof(sa0));
-	sa0.sa_family = AF_INET;
-	error = bind(peerfd, &sa0, sizeof(sa0));
-
-	tx_setblockopt(peerfd, 0);
-	tx_aiocb_init(&up->remote, loop, peerfd);
-
-	sin0.sin_family = AF_INET;
-	sin0.sin_port   = htons(80);
-	sin0.sin_addr.s_addr = inet_addr("103.235.46.39");
-	tx_aiocb_connect(&up->remote, (struct sockaddr *)&sin0, sizeof(sin0), &up->task);
-#else
 	tx_aiocb_init(&up->remote, loop, -1);
 	tx_task_active(&up->task);
-#endif
 
 	up->flags = 0;
 	up->c2r.flag = 0;
 	up->c2r.len = up->c2r.off = 0;
 	up->r2c.flag = 0;
 	up->r2c.len = up->r2c.off = 0;
-#if defined(USE_JUST_FORWARD)
-	up->flags |= FORWARD_PROTO;
-#endif
+	strcpy(up->domain, "HELO");
 
 	fprintf(stderr, "newfd: %d to here\n", newfd);
 	return;
@@ -1037,10 +791,8 @@ static void do_channel_prepare(struct channel_context *up, int newfd, unsigned s
 
 static void do_listen_accepted(void *up)
 {
-	const char *name;
 	struct listen_context *lp0;
 	struct channel_context *cc0;
-	union { struct sockaddr sa; struct sockaddr_in si; } local;
 
 	lp0 = (struct listen_context *)up;
 
@@ -1057,6 +809,9 @@ static void do_listen_accepted(void *up)
 		}
 
 		do_channel_prepare(cc0, newfd, lp0->port);
+		if (lp0->just_forward) {
+			cc0->flags |= FORWARD_PROTO;
+		}
 	}
 
 	return;
@@ -1100,6 +855,7 @@ struct listen_context * txlisten_create(struct tcpip_info *info)
 
 int main(int argc, char *argv[])
 {
+	int just_forward = 0;
 	int i, err, bind_ok = 0;
 	struct tcpip_info info = {0};
 	struct listen_context *upp;
@@ -1110,11 +866,6 @@ int main(int argc, char *argv[])
 	tx_poll_t *poll2 = tx_kqueue_init(loop);
 	tx_poll_t *poll1 = tx_completion_port_init(loop);
 	tx_timer_ring *provider = tx_timer_ring_get(loop);
-	tx_timer_ring *provider1 = tx_timer_ring_get(loop);
-	tx_timer_ring *provider2 = tx_timer_ring_get(loop);
-
-	TX_CHECK(provider1 == provider, "timer provider not equal");
-	TX_CHECK(provider2 == provider, "timer provider not equal");
 
 	for (i = 1; i < argc; i++) {
 		if (strncmp(argv[i], "-l", 2) == 0) {
@@ -1137,12 +888,18 @@ int main(int argc, char *argv[])
 			fprintf(stderr, "\t-h print this help\n");
 			fprintf(stderr, "\n");
 			exit(0);
+		} else if (strncmp(argv[i], "-f", 2) == 0) {
+			TX_CHECK(i + 1 < argc, "missing argument");
+			err = get_target_address(&_remote_target, argv[++i]);
+			TX_CHECK(err == 0, "get target address failure");
+			just_forward = 1;
 		} else if (*argv[i] == '-') {
 			fprintf(stderr, "unkown option: %s\n", argv[i]);
 			exit(0);
 		} else {
 			err = get_target_address(&_remote_target, argv[i]);
 			TX_CHECK(err == 0, "get target address failure");
+			just_forward = 1;
 		}
 	}
 
@@ -1152,7 +909,9 @@ int main(int argc, char *argv[])
 	tx_taskq_init(&_protect_cond);
 	tx_task_init(&_protect_task, loop, check_protect_socks, loop);
 	upp = txlisten_create(&info);
+	upp->just_forward = just_forward;
 
+	signal(SIGPIPE, SIG_IGN);
 	for ( ; ; ) {
 		int fd;
 		tx_loop_main(loop);
@@ -1177,8 +936,10 @@ int main(int argc, char *argv[])
 	tx_loop_delete(loop);
 
 	TX_UNUSED(last_tick);
-	TX_UNUSED(provider2);
-	TX_UNUSED(provider1);
+	TX_UNUSED(provider);
+	TX_UNUSED(poll2);
+	TX_UNUSED(poll1);
+	TX_UNUSED(poll);
 
 	return 0;
 }

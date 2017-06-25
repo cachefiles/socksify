@@ -13,12 +13,15 @@ LOCAL_CXXFLAGS := -I$(THIS_PATH)/libtx/include -I$(THIS_PATH)
 LOCAL_CFLAGS := $(LOCAL_CXXFLAGS)
 LOCAL_LDLIBS := -lstdc++
 
+BIN_FMT_TARGET := $(shell $(THIS_PATH)/getos.sh CC=$(CC))
+BUILD_TARGET   ?= $(BIN_FMT_TARGET)
+
 ifeq ($(BUILD_TARGET), mingw)
 LOCAL_LDFLAGS += -static
 LOCAL_LDLIBS += -lws2_32
 endif
 
-ifeq ($(BUILD_TARGET), Linux)
+ifeq ($(BUILD_TARGET), linux)
 LOCAL_LDLIBS += -lrt
 endif
 
