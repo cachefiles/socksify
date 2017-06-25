@@ -869,7 +869,7 @@ int main(int argc, char *argv[])
 
 	for (i = 1; i < argc; i++) {
 		if (strncmp(argv[i], "-l", 2) == 0) {
-			const char *bind_info = &argv[i][3];
+			const char *bind_info = &argv[i][2];
 			if (*bind_info == 0) {
 				TX_CHECK(i + 1 < argc, "missing bind argument info");
 				bind_info = argv[++i];
