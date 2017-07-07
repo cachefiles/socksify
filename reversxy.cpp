@@ -26,24 +26,21 @@
 #define FAILURE_SAFEEXIT(cond, fmt, args...) do { if ((cond) == 0) break; fprintf(stderr, fmt, args); exit(0); } while ( 0 )
 
 struct listen_context {
-    int flags;
+	int flags;
 	int just_forward;
-    unsigned int port;
+	unsigned int port;
 
-    tx_aiocb file;
-    tx_task_t task;
+	tx_aiocb file;
+	tx_task_t task;
 };
 
 struct relay_data {
-    int off;
-    int len;
+	int off;
+	int len;
 #define RDF_EOF 0x01
 #define RDF_FIN 0x02
-    int flag;
-    char buf[4096];
-
-	tx_task_t rtask;
-	tx_task_t wtask;
+	int flag;
+	char buf[4096];
 
 	int stat_total;
 };
@@ -123,18 +120,18 @@ void set_socksify_addr(struct sockaddr_in *relay)
 struct listen_context * txlisten_create(struct tcpip_info *info);
 extern "C" int main_loop_prepare(const char *local)
 {
-    int err;
-    struct tcpip_info info = {0};
-    static struct listen_context *upp = NULL;
+	int err;
+	struct tcpip_info info = {0};
+	static struct listen_context *upp = NULL;
 
-    tx_loop_t *loop = tx_loop_default();
-    tx_poll_t *poll = tx_epoll_init(loop);
-    tx_timer_ring *provider = tx_timer_ring_get(loop);
+	tx_loop_t *loop = tx_loop_default();
+	tx_poll_t *poll = tx_epoll_init(loop);
+	tx_timer_ring *provider = tx_timer_ring_get(loop);
 	TX_UNUSED(provider);
 	TX_UNUSED(poll);
 
-    err = get_target_address(&info, local);
-    TX_CHECK(err == 0, "get target address failure");
+	err = get_target_address(&info, local);
+	TX_CHECK(err == 0, "get target address failure");
 
 	if (_protect_initialize == 0) {
 		tx_taskq_init(&_stop_queue);
@@ -296,13 +293,13 @@ struct channel_context {
 
 struct channel_context *_dbg_ctx = NULL;
 
-int relay_fill_prepare(struct relay_data *d, tx_aiocb *f)
+int relay_fill_prepare(struct relay_data *d, tx_aiocb *f, tx_task_t *t)
 {
 	int error = 0;
 
 	if ((d->flag == 0) && !tx_readable(f) &&
 			d->len < (int)sizeof(d->buf)) {
-		tx_aincb_active(f, &d->rtask);
+		tx_aincb_active(f, t);
 		error = 1;
 	} else {
 		printf("fallback %x %d %d: %s\n", d->flag, tx_readable(f), d->len, _dbg_ctx? _dbg_ctx->domain: "");
@@ -311,12 +308,12 @@ int relay_fill_prepare(struct relay_data *d, tx_aiocb *f)
 	return error;
 }
 
-int relay_write_prepare(struct relay_data *d, tx_aiocb *f)
+int relay_write_prepare(struct relay_data *d, tx_aiocb *f, tx_task_t *t)
 {
 	int error = 0;
 
 	if ((d->off < d->len || d->flag == RDF_EOF) && !tx_writable(f)) {
-		tx_outcb_prepare(f, &d->wtask, 0);
+		tx_outcb_prepare(f, t, 0);
 		error = 1;
 	}
 
@@ -441,10 +438,6 @@ static void do_channel_release(struct channel_context *up)
 	tx_aiocb_fini(cb);
 	closesocket(fd);
 
-	tx_task_drop(&up->c2r.rtask);
-	tx_task_drop(&up->c2r.wtask);
-	tx_task_drop(&up->r2c.rtask);
-	tx_task_drop(&up->r2c.wtask);
 	tx_task_drop(&up->on_stop);
 	tx_task_drop(&up->task);
 
@@ -612,7 +605,7 @@ static int do_channel_poll(struct channel_context *up)
 		change = fill_relay_data(&up->c2r, &up->file);
 		up->flags |= check_proxy_proto(&up->c2r);
 		if (NONE_PROTO == (up->flags & SUPPORTED_PROTO)) {
-			int prep = relay_fill_prepare(&up->c2r, &up->file);
+			int prep = relay_fill_prepare(&up->c2r, &up->file, &up->task);
 			if (prep == 0) fprintf(stderr, "%p proto detected return : %x %x %d %d %d\n",
 					up, prep, up->flags, up->c2r.len, up->c2r.flag & RDF_EOF, change);
 			return prep;
@@ -625,7 +618,7 @@ static int do_channel_poll(struct channel_context *up)
 		char targethost[128];
 		change = fill_relay_data(&up->c2r, &up->file);
 		if (parse_https_target(&up->c2r, targethost)) {
-			return relay_fill_prepare(&up->c2r, &up->file);
+			return relay_fill_prepare(&up->c2r, &up->file, &up->task);
 		}
 
 		strcpy(up->domain, targethost);
@@ -639,7 +632,7 @@ static int do_channel_poll(struct channel_context *up)
 		up->r2c.len = strlen(resp);
 		up->c2r.len = 0;
 		up->c2r.off = 0;
-	
+
 		fprintf(stderr, "https targethost: %s\n", targethost);
 		up->flags |= (START_PROTO| DIRECT_PROTO);
 		up->flags &= ~HTTPS_PROTO;
@@ -650,7 +643,7 @@ static int do_channel_poll(struct channel_context *up)
 		char targethost[128];
 		change = fill_relay_data(&up->c2r, &up->file);
 		if (parse_http_target(&up->c2r, targethost)) {
-			return relay_fill_prepare(&up->c2r, &up->file);
+			return relay_fill_prepare(&up->c2r, &up->file, &up->task);
 		}
 
 		strcpy(up->domain, targethost);
@@ -658,7 +651,7 @@ static int do_channel_poll(struct channel_context *up)
 			fprintf(stderr,  "http target: %s\n", targethost);
 			return 0;
 		}
-	
+
 		fprintf(stderr, "http target: %s\n", targethost);
 		up->flags |= (START_PROTO| DIRECT_PROTO);
 		up->flags &= ~HTTP_PROTO;
@@ -729,11 +722,11 @@ static int do_channel_poll(struct channel_context *up)
 	try_shutdown_relay(&up->c2r, &up->remote);
 	try_shutdown_relay(&up->r2c, &up->file);
 
-	error  = relay_fill_prepare(&up->c2r, &up->file);
-	error |= relay_fill_prepare(&up->r2c, &up->remote);
+	error  = relay_fill_prepare(&up->c2r, &up->file, &up->task);
+	error |= relay_fill_prepare(&up->r2c, &up->remote, &up->task);
 
-	error |= relay_write_prepare(&up->c2r, &up->remote);
-	error |= relay_write_prepare(&up->r2c, &up->file);
+	error |= relay_write_prepare(&up->c2r, &up->remote, &up->task);
+	error |= relay_write_prepare(&up->r2c, &up->file, &up->task);
 
 	return error;
 }
@@ -763,10 +756,6 @@ static void do_channel_prepare(struct channel_context *up, int newfd, unsigned s
 	tx_aiocb_init(&up->file, loop, newfd);
 	tx_task_init(&up->on_stop, loop, do_channel_release_wrapper, up);
 	tx_task_init(&up->task, loop, do_channel_wrapper, up);
-	tx_task_init(&up->c2r.rtask, loop, do_channel_wrapper, up);
-	tx_task_init(&up->c2r.wtask, loop, do_channel_wrapper, up);
-	tx_task_init(&up->r2c.rtask, loop, do_channel_wrapper, up);
-	tx_task_init(&up->r2c.wtask, loop, do_channel_wrapper, up);
 	tx_timer_init(&up->on_dead, loop, &up->on_stop);
 	on_loop_cleanup(&up->on_stop);
 	up->is_mobile = 1;
@@ -819,38 +808,38 @@ static void do_listen_accepted(void *up)
 
 struct listen_context * txlisten_create(struct tcpip_info *info)
 {
-    int fd;
-    int err;
-    int option = 1;
-    tx_loop_t *loop;
-    struct sockaddr_in sa0;
-    struct listen_context *up;
+	int fd;
+	int err;
+	int option = 1;
+	tx_loop_t *loop;
+	struct sockaddr_in sa0;
+	struct listen_context *up;
 
-    fd = socket(AF_INET, SOCK_STREAM, 0);
+	fd = socket(AF_INET, SOCK_STREAM, 0);
 
-    tx_setblockopt(fd, 0);
+	tx_setblockopt(fd, 0);
 
-    setsockopt(fd,SOL_SOCKET, SO_REUSEADDR, (char*)&option,sizeof(option));
+	setsockopt(fd,SOL_SOCKET, SO_REUSEADDR, (char*)&option,sizeof(option));
 
-    sa0.sin_family = AF_INET;
-    sa0.sin_port   = info->port;
-    sa0.sin_addr.s_addr = info->address;
+	sa0.sin_family = AF_INET;
+	sa0.sin_port   = info->port;
+	sa0.sin_addr.s_addr = info->address;
 
-    err = bind(fd, (struct sockaddr *)&sa0, sizeof(sa0));
-    if (err != 0) fprintf(stderr, "bind tcp port failure: port=%d\n", htons(info->port));
-    assert(err == 0);
+	err = bind(fd, (struct sockaddr *)&sa0, sizeof(sa0));
+	if (err != 0) fprintf(stderr, "bind tcp port failure: port=%d\n", htons(info->port));
+	assert(err == 0);
 
-    err = listen(fd, 5);
-    assert(err == 0);
+	err = listen(fd, 5);
+	assert(err == 0);
 
-    loop = tx_loop_default();
-    up = new listen_context();
-    up->port = info->port;
-    tx_listen_init(&up->file, loop, fd);
-    tx_task_init(&up->task, loop, do_listen_accepted, up);
-    tx_listen_active(&up->file, &up->task);
+	loop = tx_loop_default();
+	up = new listen_context();
+	up->port = info->port;
+	tx_listen_init(&up->file, loop, fd);
+	tx_task_init(&up->task, loop, do_listen_accepted, up);
+	tx_listen_active(&up->file, &up->task);
 
-    return up;
+	return up;
 }
 
 int main(int argc, char *argv[])
