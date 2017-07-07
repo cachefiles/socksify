@@ -21,6 +21,30 @@
 #define SD_BOTH SHUT_RDWR
 #endif
 
+#define RDF_MASK(ff) ((ff) & (RDF_FIN| RDF_EOF))
+#define STACK2TASK(s) (&(s)->tx_sched)
+
+#define LOG_ERROR(fmt, args...) fprintf(stderr, fmt, ##args)
+#define LOG_WARNN(fmt, args...) fprintf(stderr, fmt, ##args)
+#define LOG_DEBUG(fmt, args...) fprintf(stderr, fmt, ##args)
+// #define LOG_VERBOSE(fmt, args...) fprintf(stderr, fmt, ##args)
+
+#ifndef LOG_ERROR
+#define LOG_ERROR(fmt, args...)
+#endif
+
+#ifndef LOG_WARNN
+#define LOG_WARNN(fmt, args...)
+#endif
+
+#ifndef LOG_DEBUG
+#define LOG_DEBUG(fmt, args...)
+#endif
+
+#ifndef LOG_VERBOSE
+#define LOG_VERBOSE(fmt, args...)
+#endif
+
 // #define USE_JUST_FORWARD
 #define STDIN_FILE_FD 0
 #define FAILURE_SAFEEXIT(cond, fmt, args...) do { if ((cond) == 0) break; fprintf(stderr, fmt, args); exit(0); } while ( 0 )
@@ -37,13 +61,24 @@ struct listen_context {
 struct relay_data {
 	int off;
 	int len;
+
 #define RDF_EOF 0x01
 #define RDF_FIN 0x02
+
+	int limit;
+	int content_length;
+#define RDF_LENGTH 0x04
+#define RDF_CHUNKED 0x08
+#define RDF_CHUNKED_EOF 0x10
+
 	int flag;
 	char buf[4096];
+	int padding;
 
 	int stat_total;
 };
+
+static int _connect_total = 0;
 
 int _protect_req = 0;
 int _protect_count = 0;
@@ -220,7 +255,7 @@ int fill_relay_data(struct relay_data *d, tx_aiocb *f)
 	if (d->off >= d->len) d->off = d->len = 0;
 
 	while (tx_readable(f) &&
-			d->len < (int)sizeof(d->buf) && !d->flag) {
+			d->len < (int)sizeof(d->buf) && !RDF_MASK(d->flag)) {
 		len = recv(f->tx_fd, d->buf + d->len, sizeof(d->buf) - d->len, 0);
 		tx_aincb_update(f, len);
 
@@ -263,7 +298,7 @@ int try_shutdown_relay(struct relay_data *d, tx_aiocb *f)
 	if (d->off >= d->len) {
 		d->off = d->len = 0;
 
-		if (d->flag == RDF_EOF && tx_writable(f)) {
+		if (RDF_MASK(d->flag) == RDF_EOF && tx_writable(f)) {
 			shutdown(f->tx_fd, SD_BOTH);
 			d->flag |= RDF_FIN;
 		}
@@ -278,9 +313,9 @@ struct channel_context {
 	int is_mobile;
 	tx_aiocb file;
 	tx_aiocb remote;
-	tx_task_t task;
 	tx_task_t on_stop;
 	tx_timer_t on_dead;
+	tx_task_stack_t task;
 
 	int port;
 	in_addr target;
@@ -293,13 +328,14 @@ struct channel_context {
 
 struct channel_context *_dbg_ctx = NULL;
 
-int relay_fill_prepare(struct relay_data *d, tx_aiocb *f, tx_task_t *t)
+int relay_fill_prepare(struct relay_data *d, tx_aiocb *f, tx_task_stack_t *t)
 {
 	int error = 0;
+	int flags = RDF_MASK(d->flag);
 
-	if ((d->flag == 0) && !tx_readable(f) &&
+	if ((flags == 0) && !tx_readable(f) &&
 			d->len < (int)sizeof(d->buf)) {
-		tx_aincb_active(f, t);
+		tx_aincb_active(f, &t->tx_sched);
 		error = 1;
 	} else {
 		printf("fallback %x %d %d: %s\n", d->flag, tx_readable(f), d->len, _dbg_ctx? _dbg_ctx->domain: "");
@@ -308,12 +344,13 @@ int relay_fill_prepare(struct relay_data *d, tx_aiocb *f, tx_task_t *t)
 	return error;
 }
 
-int relay_write_prepare(struct relay_data *d, tx_aiocb *f, tx_task_t *t)
+int relay_write_prepare(struct relay_data *d, tx_aiocb *f, tx_task_stack_t *t)
 {
 	int error = 0;
+	int flags = RDF_MASK(d->flag);
 
-	if ((d->off < d->len || d->flag == RDF_EOF) && !tx_writable(f)) {
-		tx_outcb_prepare(f, t, 0);
+	if ((d->off < d->len || flags == RDF_EOF) && !tx_writable(f)) {
+		tx_outcb_prepare(f, STACK2TASK(t), 0);
 		error = 1;
 	}
 
@@ -332,6 +369,10 @@ enum {
 
 	START_PROTO = (1 << 6),
 	DIRECT_PROTO = (1 << 7),
+
+	HTTP_REQUEST = (1 << 8),
+	HTTP_RESPONSE = (1 << 9),
+	CLOSE_PROTO = (1 << 10),
 };
 
 static const int SUPPORTED_PROTO = UNKOWN_PROTO| SOCKV4_PROTO| SOCKV5_PROTO| HTTP_PROTO| HTTPS_PROTO| FORWARD_PROTO| DIRECT_PROTO ;
@@ -421,6 +462,7 @@ static int check_proxy_proto(struct relay_data *d)
 static void do_channel_release(struct channel_context *up)
 {
 	int fd;
+	_connect_total--;
 	tx_aiocb *cb = &up->file;
 	tx_timer_stop(&up->on_dead);
 	tx_outcb_cancel(cb, 0);
@@ -438,8 +480,8 @@ static void do_channel_release(struct channel_context *up)
 	tx_aiocb_fini(cb);
 	closesocket(fd);
 
+	tx_task_stack_drop(&up->task);
 	tx_task_drop(&up->on_stop);
-	tx_task_drop(&up->task);
 
 	delete up;
 }
@@ -451,52 +493,56 @@ static void do_channel_release_wrapper(void *up)
 	return;
 }
 
-static int parse_https_target(struct relay_data *d, char *host)
+static int parse_https_target(struct relay_data *d, char *host, size_t len)
 {
-	char buf[128];
-	sscanf(d->buf, "CONNECT %s", buf);
+	char buf[128] =  {};
+	sscanf(d->buf, "CONNECT %127s", buf);
 
-	strcpy(host, buf);
+	strncpy(host, buf, len -1);
 	return 0;
 }
 
 #define N 10
-#define DEBUG(msg, ...)
 
-static int parse_http_target(struct relay_data *d, char *host)
+static int parse_http_target(struct relay_data *d, char *host, size_t len)
 {
 	char *p, *delter;
 	char uri[512], method[16], ver[16];
-	sscanf(d->buf, "%s %s %s", method, uri, ver);
+	sscanf(d->buf, "%16s %511s %15s", method, uri, ver);
 
+	LOG_DEBUG("off: %d\n", d->off);
+	assert(d->off == 0);
 	if ((memmem(d->buf, d->len, "\r\n\r\n", 4) == NULL) &&
 			((memcmp(uri, "http://", 7) && memcmp(uri, "https://", 8)) || (memmem(d->buf, d->len, "\r\n", 2) == NULL))) {
-		fprintf(stderr, "request not finish: ##|%s|## %d %s %s %s\n", d->buf, d->len, method, uri, ver);
+		LOG_VERBOSE("request not finish: ##|%s|## %d %s %s %s\n", d->buf, d->len, method, uri, ver);
 		return 1;
 	}
 
 	delter = (uri + 7);
 	if (*uri == '/' && d->len < sizeof(d->buf)) {
+		assert(d->len <= sizeof(d->buf));
 		d->buf[d->len] = 0;
 
-		char host[512], path[512];
+		char host[512] = {}, path[512] = {};
 		p = strcasestr(d->buf, "\nHost: ");
 		if (p != NULL) {
-			strcpy(path, uri);
-			sscanf(p + 7, "%s", host);
-			sprintf(uri, "http://%s%s", host, path);
+			strncpy(path, uri, sizeof(path) -1);
+			sscanf(p + 7, "%511s", host);
+			snprintf(uri, sizeof(uri), "http://%s%s", host, path);
 		}
 	}
 
 	p = strchr(delter, '/');
 	if (p) {
+		assert(p - delter < len);
 		memcpy(host, delter, p - delter);
 		host[p - delter] = 0;
 		delter = p;
 	} else {
-		strcpy(host, delter);
+		strncpy(host, delter, len -1);
 	}
 
+#if 0
 	p = (char *)memmem(d->buf, d->len, "\r\n", 2);
 	if (p != NULL) {
 		char *line_limit = p;
@@ -515,6 +561,7 @@ static int parse_http_target(struct relay_data *d, char *host)
 			}
 		}
 	}
+#endif
 
 	return 0;
 }
@@ -549,7 +596,7 @@ static int do_forward_connect(int peerfd, tx_aiocb *s, char *domain, tx_task_t *
 	return tx_aiocb_connect(s, (struct sockaddr *)&_relay0, sizeof(_relay0), t);
 }
 
-static int do_host_connect(tx_aiocb *s, char *domain, int port, tx_task_t *t)
+static int do_host_connect(tx_aiocb *s, char *domain, int port, tx_task_stack_t *t)
 {
 	int error = -1;
 	struct sockaddr_in sin0;
@@ -559,7 +606,7 @@ static int do_host_connect(tx_aiocb *s, char *domain, int port, tx_task_t *t)
 	info.port = htons(port);
 	error = get_target_address(&info, domain);
 	if (error != 0) {
-		fprintf(stderr, "failure targethost: %s\n", domain);
+		LOG_WARNN("failure target host: %s\n", domain);
 		return -1;
 	}
 
@@ -571,152 +618,203 @@ static int do_host_connect(tx_aiocb *s, char *domain, int port, tx_task_t *t)
 	sin0.sin_family = AF_INET;
 	error = bind(peerfd, (struct sockaddr *)&sin0, sizeof(sin0));
 
+	tx_aiocb_fini(s);
+	closesocket(s->tx_fd);
+
 	tx_aiocb_init(s, loop, peerfd);
 
 	sin0.sin_family = AF_INET;
 	sin0.sin_port   = (info.port);
 	sin0.sin_addr.s_addr = (info.address);
-	error = tx_aiocb_connect(s, (struct sockaddr *)&sin0, sizeof(sin0), t);
+	error = tx_aiocb_connect(s, (struct sockaddr *)&sin0, sizeof(sin0), STACK2TASK(t));
 
-	fprintf(stderr, "connect to %s: %x:%d %d\n", domain, info.address, htons(info.port), error);
+	LOG_WARNN("connect to %s: %x:%d %d\n", domain, info.address, htons(info.port), error);
 	return error;
 }
 
 static struct tcpip_info _remote_target = {0};
 
-static int do_channel_poll(struct channel_context *up)
+static int parse_http_response(struct channel_context *up, struct relay_data *r)
 {
-	int error = 0;
-	int change = 0;
+	const char *ptr;
+	const char content_length[] = "Content-Length:";
+	const char transfer_encoding[] = "Transfer-Encoding:";
 
-	tx_timer_reset(&up->on_dead, 300000);
+	assert(r->len <= sizeof(r->buf));
+	r->buf[r->len] = 0;
 
-	_dbg_ctx = up;
-	if (up->flags & START_PROTO) {
-		if (!tx_writable(&up->remote)) {
-			return 1;
-		}
+	if ((ptr = strstr(r->buf, transfer_encoding)) != NULL) {
+		ptr += strlen(transfer_encoding);
+		while (*ptr == ' ') ptr++;
 
-		fprintf(stderr, "connect is finish\n");
-		up->flags &= ~START_PROTO;
+		if (strncmp(ptr, "chunked", 7) == 0) r->flag |= RDF_CHUNKED;
+		LOG_VERBOSE("TE %s %s\n", transfer_encoding, ptr);
+
+		r->content_length = 0;
+	} else if ((ptr = strstr(r->buf, content_length)) != NULL) {
+		ptr += strlen(content_length);
+		while (*ptr == ' ') ptr++;
+
+		r->flag |= RDF_LENGTH;
+		r->content_length = atoi(ptr);
+		LOG_VERBOSE("CL %s %s |%d\n", content_length, ptr, r->content_length);
+	} else {
+		r->content_length = 1000000;
+		up->flags |= CLOSE_PROTO;
 	}
 
-	if (NONE_PROTO == (up->flags & SUPPORTED_PROTO)) {
-		change = fill_relay_data(&up->c2r, &up->file);
-		up->flags |= check_proxy_proto(&up->c2r);
-		if (NONE_PROTO == (up->flags & SUPPORTED_PROTO)) {
-			int prep = relay_fill_prepare(&up->c2r, &up->file, &up->task);
-			if (prep == 0) fprintf(stderr, "%p proto detected return : %x %x %d %d %d\n",
-					up, prep, up->flags, up->c2r.len, up->c2r.flag & RDF_EOF, change);
-			return prep;
-		}
-
-		fprintf(stderr, "proto detected: %x\n", up->flags);
-	}
-
-	if (up->flags &  HTTPS_PROTO) {
-		char targethost[128];
-		change = fill_relay_data(&up->c2r, &up->file);
-		if (parse_https_target(&up->c2r, targethost)) {
-			return relay_fill_prepare(&up->c2r, &up->file, &up->task);
-		}
-
-		strcpy(up->domain, targethost);
-		if (do_host_connect(&up->remote, targethost, 443, &up->task) == -1) {
-			fprintf(stderr,  "https target: %s\n", targethost);
-			return 0;
-		}
-
-		char resp[] = "HTTP/1.0 200 OK\r\n\r\n";
-		strcpy(up->r2c.buf, resp);
-		up->r2c.len = strlen(resp);
-		up->c2r.len = 0;
-		up->c2r.off = 0;
-
-		fprintf(stderr, "https targethost: %s\n", targethost);
-		up->flags |= (START_PROTO| DIRECT_PROTO);
-		up->flags &= ~HTTPS_PROTO;
-		return 1;
-	}
-
-	if (up->flags &  HTTP_PROTO) {
-		char targethost[128];
-		change = fill_relay_data(&up->c2r, &up->file);
-		if (parse_http_target(&up->c2r, targethost)) {
-			return relay_fill_prepare(&up->c2r, &up->file, &up->task);
-		}
-
-		strcpy(up->domain, targethost);
-		if (do_host_connect(&up->remote, targethost, 80, &up->task) == -1) {
-			fprintf(stderr,  "http target: %s\n", targethost);
-			return 0;
-		}
-
-		fprintf(stderr, "http target: %s\n", targethost);
-		up->flags |= (START_PROTO| DIRECT_PROTO);
-		up->flags &= ~HTTP_PROTO;
-		return 1;
-	}
-
-	if (FORWARD_PROTO & up->flags) {
-		struct sockaddr_in sin0;
-		int peerfd = get_protect_socket();
-
-		if (peerfd == -1) {
-			wait_protected_socket(&up->task);
-			return 1;
-		}
-
-
-		tx_setblockopt(peerfd, 0);
-
-		memset(&sin0, 0, sizeof(sin0));
-		sin0.sin_family = AF_INET;
-		error = bind(peerfd, (struct sockaddr *)&sin0, sizeof(sin0));
-
-		tx_loop_t *loop = tx_loop_default();
-		tx_aiocb_init(&up->remote, loop, peerfd);
-
-		sin0.sin_family = AF_INET;
-		sin0.sin_port   = _remote_target.port;
-		sin0.sin_addr.s_addr = _remote_target.address;
-
-		if (tx_aiocb_connect(&up->remote,
-					(struct sockaddr *)&sin0, sizeof(sin0), &up->task) == -1) {
-			return 0;
-		}
-
-		socklen_t locallen;
-		struct sockaddr_in localname;
-		locallen = sizeof(localname);
-		int err = getsockname(peerfd, (struct sockaddr *)&localname, &locallen);
-		if (err == 0) {
-			up->is_mobile = ((localname.sin_addr.s_addr & htonl(0xff000000)) == htonl(0x0a000000));
-		}		
-
-		up->flags |= (START_PROTO| DIRECT_PROTO);
-		up->flags &= ~FORWARD_PROTO;
-		return 1;
-	}
-
-	if (DIRECT_PROTO != (up->flags & DIRECT_PROTO)) {
-		up->c2r.buf[up->c2r.len] = 0;
-		fprintf(stderr, "proto handle error: %x %x %d %s\n", up->flags, up->c2r.flag, up->c2r.len, up->c2r.buf);
+	if ((ptr = strstr(r->buf, "\r\n\r\n")) != NULL) {
+		r->limit = (ptr + 4 - r->buf);
+		LOG_VERBOSE("parse_http_response: %p %x \n%.*s\n", up, r->flag, r->limit, r->buf);
 		return 0;
 	}
 
+	if (r->flag & RDF_EOF) {
+		LOG_VERBOSE("unexpected End of file %d %d %s\n", r->off, r->len, r->buf);
+		up->flags |= CLOSE_PROTO;
+		return 1;
+	}
+
+	return -1;
+}
+
+static void block_transfer(void *upp, tx_task_stack_t *sta)
+{
+	struct channel_context *up = (struct channel_context *)upp;
+	struct relay_data *d = &up->r2c;
+	tx_aiocb *f = &up->file;
+	int change = 0;
+	int len;
+
+	LOG_VERBOSE("block_transfer enter: %p %d\n", upp, d->limit);
 	do {
-		change = fill_relay_data(&up->c2r, &up->file);
-		if (change & 0x02) return 0;
-		change |= write_relay_data(&up->c2r, &up->remote, up->is_mobile);
-		if (change & 0x02) return 0;
+		change = fill_relay_data(&up->r2c, &up->remote);
+		if (change & 0x02) goto exception;
+
+		if (tx_writable(f) && d->off < d->len && d->limit) {
+			do {
+				int limit = d->len - d->off;
+				if (limit > d->limit) limit = d->limit;
+
+				len = tx_outcb_write(f, d->buf + d->off, limit);
+				if (len > 0) {
+					change |= (len > 0);
+					d->off += len;
+					d->limit -= len;
+					d->stat_total += len;
+				} else if (tx_writable(f)) {
+					goto exception;
+				}
+			} while (len > 0 && d->off < d->len && d->limit);
+		}
+
+	} while (change);
+
+	LOG_VERBOSE("block_transfer fast leave: %d %d %d %d\n", d->limit, d->off, d->len, change);
+	if (d->limit > 0 && !(up->r2c.flag & RDF_EOF)) {
+		int error = relay_fill_prepare(&up->r2c, &up->remote, &up->task);
+		error |= relay_write_prepare(&up->r2c, &up->file, &up->task);
+		assert (error != 0);
+		return;
+	}
+
+	LOG_VERBOSE("block_transfer full leave: %p %d\n", upp, d->limit);
+	tx_task_stack_pop1(&up->task, 0);
+	tx_task_stack_active(&up->task);
+	d->limit = 0;
+	return;
+
+exception:
+	up->flags |= UNKOWN_PROTO;
+	tx_task_stack_raise(sta);
+	return;
+}
+
+int parse_http_chunk(struct channel_context *up, struct relay_data *r)
+{
+	int chunk_len;
+	const char *ptr;
+	const char *base = &r->buf[r->off];
+	assert(r->len <= sizeof(r->buf));
+	r->buf[r->len] = 0;
+
+	if ((ptr = strstr(base, "\r\n")) != NULL) {
+		sscanf(base, "%x", &chunk_len);
+		if (chunk_len == 0) r->flag |= RDF_CHUNKED_EOF;
+		r->limit = (ptr + 2 - base) + chunk_len + 2;
+		LOG_VERBOSE("chunk length: %d %x %.4s\n", chunk_len, chunk_len, base);
+		return 0;
+	}
+
+	if (r->flag & RDF_EOF) {
+		LOG_ERROR("unexpected End of file\n");
+		assert(0);
+	}
+
+	return -1;
+}
+
+static void chunk_transfer(void *upp, tx_task_stack_t *sta)
+{
+	struct channel_context *up = (struct channel_context *)upp;
+	int change;
+
+	change = fill_relay_data(&up->r2c, &up->remote);
+	if (change & 0x02) goto exception;
+
+	if (up->r2c.limit > 0) {
+		tx_task_stack_push(&up->task, block_transfer, up);
+		tx_task_stack_active(&up->task);
+		return;
+	}
+
+	if (0 == (up->r2c.flag & RDF_CHUNKED_EOF) && parse_http_chunk(up, &up->r2c) < 0) {
+		int error = relay_fill_prepare(&up->r2c, &up->remote, &up->task);
+		assert (error != 0);
+		return;
+	}
+
+	if (up->r2c.limit > 0) {
+		tx_task_stack_push(&up->task, block_transfer, up);
+		tx_task_stack_active(&up->task);
+		return;
+	}
+
+	tx_task_stack_pop1(&up->task, 0);
+	tx_task_stack_active(&up->task);
+	up->r2c.flag &= ~RDF_CHUNKED_EOF;
+	up->r2c.flag &= ~RDF_CHUNKED;
+	return;
+
+exception:
+	up->flags |= UNKOWN_PROTO;
+	tx_task_stack_raise(sta);
+	return;
+}
+
+static void https_proto_transfer(void *upp, tx_task_stack_t *sta)
+{
+	struct channel_context *up = (struct channel_context *)upp;
+	int change = 0;
+	int error = 0;
+	
+	LOG_DEBUG("https_proto_transfer enter: %p %s\n", up, up->domain);
+	do {
+		change = fill_relay_data(&up->r2c, &up->remote);
+		if (change & 0x02) goto exception;
+
+		change |= write_relay_data(&up->r2c, &up->file, 0);
+		if (change & 0x02) goto exception;
+
 	} while (change);
 
 	do {
-		change = fill_relay_data(&up->r2c, &up->remote);
-		if (change & 0x02) return 0;
-		change |= write_relay_data(&up->r2c, &up->file, up->is_mobile);
-		if (change & 0x02) return 0;
+		change = fill_relay_data(&up->c2r, &up->file);
+		if (change & 0x02) goto exception;
+
+		change |= write_relay_data(&up->c2r, &up->remote, 0);
+		if (change & 0x02) goto exception;
+
 	} while (change);
 
 	try_shutdown_relay(&up->c2r, &up->remote);
@@ -727,11 +825,193 @@ static int do_channel_poll(struct channel_context *up)
 
 	error |= relay_write_prepare(&up->c2r, &up->remote, &up->task);
 	error |= relay_write_prepare(&up->r2c, &up->file, &up->task);
+	if (error) return;
 
-	return error;
+exception:
+	LOG_VERBOSE("http_proto_input exception\n");
+	up->flags |= UNKOWN_PROTO;
+	tx_task_stack_raise(sta);
+	return;
 }
 
-static void do_channel_wrapper(void *up)
+static void https_proto_input(void *upp, tx_task_stack_t *sta)
+{
+	char target[128];
+	const char resp[] = "HTTP/1.0 200 OK\r\n\r\n";
+	struct channel_context *up = (struct channel_context *)upp;
+	
+	LOG_DEBUG("https_proto_input enter: %p %s\n", up, up->domain);
+	if (fill_relay_data(&up->c2r, &up->file) == 2) {
+		goto exception;
+	}
+
+	if (parse_https_target(&up->c2r, target, sizeof(target)) == 1) {
+		if (up->c2r.flag & RDF_EOF) goto exception;
+		int error = relay_fill_prepare(&up->c2r, &up->file, &up->task);
+		assert (error != 0);
+		return;
+	}
+
+	strcpy(up->domain, target);
+	if (do_host_connect(&up->remote, target, 80, &up->task) == -1) {
+		LOG_WARNN("http target: %s\n", target);
+		goto exception;
+	}
+
+	strcpy(up->r2c.buf, resp);
+	up->r2c.len = strlen(resp);
+	up->c2r.len = 0;
+	up->c2r.off = 0;
+
+	tx_task_stack_push(&up->task, https_proto_transfer, up);
+	tx_task_stack_active(&up->task);
+
+	up->flags &= ~HTTP_REQUEST;
+	up->r2c.content_length = 0;
+	up->r2c.limit = 0;
+
+	return;
+
+exception:
+	LOG_VERBOSE("https_proto_input exception\n");
+	up->flags |= UNKOWN_PROTO;
+	tx_task_stack_raise(sta);
+	return;
+}
+
+static void http_proto_transfer(void *upp, tx_task_stack_t *sta)
+{
+	int change = 1;
+	struct channel_context *up = (struct channel_context *)upp;
+
+	LOG_VERBOSE("http_proto_transfer enter: %p %s\n", up, up->domain);
+	while ((change == 1) 
+			&& (up->flags & HTTP_REQUEST) == 0) {
+		change = fill_relay_data(&up->c2r, &up->file);
+		if (change & 0x02) goto exception;
+
+		change |= write_relay_data(&up->c2r, &up->remote, up->is_mobile);
+		if (change & 0x02) goto exception;
+	}
+
+	change = fill_relay_data(&up->r2c, &up->remote);
+	if (change & 0x02) goto exception;
+
+	if ((up->flags & HTTP_RESPONSE) == 0
+			&& parse_http_response(up, &up->r2c) < 0) {
+		int error = relay_fill_prepare(&up->r2c, &up->remote, &up->task);
+		assert (error != 0);
+		return;
+	}
+
+	up->flags |= HTTP_RESPONSE;
+	up->flags |= HTTP_REQUEST;
+
+	if (up->r2c.limit > 0) {
+		tx_task_stack_push(&up->task, block_transfer, up);
+		tx_task_stack_active(&up->task);
+		return;
+	}
+
+	if (up->r2c.content_length > 0) {
+		up->r2c.limit = up->r2c.content_length;
+		up->r2c.content_length = 0;
+
+		tx_task_stack_push(&up->task, block_transfer, up);
+		tx_task_stack_active(&up->task);
+		return;
+	}
+
+	if (up->r2c.flag & RDF_CHUNKED) {
+		tx_task_stack_push(&up->task, chunk_transfer, up);
+		tx_task_stack_active(&up->task);
+		return;
+	}
+
+	LOG_VERBOSE("http_proto_transfer full leave: %p %s\n", up, up->domain);
+	if (up->flags & CLOSE_PROTO) goto exception;
+
+	tx_task_stack_pop1(&up->task, 0);
+	tx_task_stack_active(&up->task);
+	return;
+
+exception:
+	up->flags |= UNKOWN_PROTO;
+	tx_task_stack_raise(sta);
+	return;
+}
+
+static void http_proto_input(void *upp, tx_task_stack_t *sta)
+{
+	char target[128];
+	struct channel_context *up = (struct channel_context *)upp;
+	
+	LOG_DEBUG("http_proto_input enter: %p %s\n", up, up->domain);
+	if (fill_relay_data(&up->c2r, &up->file) == 2) {
+		goto exception;
+	}
+
+	if (parse_http_target(&up->c2r, target, sizeof(target)) == 1) {
+		if (up->c2r.flag & RDF_EOF) goto exception;
+		int error = relay_fill_prepare(&up->c2r, &up->file, &up->task);
+		assert (error != 0);
+		return;
+	}
+
+	strcpy(up->domain, target);
+	if (do_host_connect(&up->remote, target, 80, &up->task) == -1) {
+		LOG_WARNN("http target: %s\n", target);
+		goto exception;
+	}
+
+	tx_task_stack_push(&up->task, http_proto_transfer, up);
+	tx_task_stack_active(&up->task);
+
+	up->flags &= ~HTTP_REQUEST;
+	up->r2c.content_length = 0;
+	up->r2c.limit = 0;
+
+	return;
+
+exception:
+	LOG_VERBOSE("http_proto_input exception\n");
+	up->flags |= UNKOWN_PROTO;
+	tx_task_stack_raise(sta);
+	return;
+}
+
+static int do_channel_poll(struct channel_context *up)
+{
+	tx_timer_reset(&up->on_dead, 300000);
+
+	_dbg_ctx = up;
+	if ((NONE_PROTO == (up->flags & SUPPORTED_PROTO))
+			&& fill_relay_data(&up->c2r, &up->file) == 1) {
+		up->flags |= check_proxy_proto(&up->c2r);
+	}
+
+	if (up->flags & UNKOWN_PROTO) {
+		LOG_WARNN("conn: %p raise exception\n", up);
+		return 0;
+	}
+
+	if (up->flags & HTTP_PROTO) {
+		tx_task_stack_push(&up->task, http_proto_input, up);
+		tx_task_stack_active(&up->task);
+		return 1;
+	}
+
+	if (up->flags & HTTPS_PROTO) {
+		tx_task_stack_push(&up->task, https_proto_input, up);
+		tx_task_stack_active(&up->task);
+		return 1;
+	}
+
+	try_shutdown_relay(&up->r2c, &up->file);
+	return relay_fill_prepare(&up->c2r, &up->file, &up->task);
+}
+
+static void do_channel_wrapper(void *up, tx_task_stack_t *sta)
 {
 	int err;
 	struct channel_context *upp;
@@ -741,7 +1021,8 @@ static void do_channel_wrapper(void *up)
 
 	_dbg_ctx = 0;
 	if (err == 0) {
-		fprintf(stderr, "channel release %d %d\n", upp->c2r.stat_total, upp->r2c.stat_total);
+		LOG_DEBUG("channel release %p/%d %d %d\n",
+				upp, _connect_total, upp->c2r.stat_total, upp->r2c.stat_total);
 		do_channel_release(upp);
 		return;
 	}
@@ -753,9 +1034,13 @@ static void do_channel_prepare(struct channel_context *up, int newfd, unsigned s
 {
 	tx_loop_t *loop = tx_loop_default();
 
+	_connect_total++;
 	tx_aiocb_init(&up->file, loop, newfd);
 	tx_task_init(&up->on_stop, loop, do_channel_release_wrapper, up);
-	tx_task_init(&up->task, loop, do_channel_wrapper, up);
+
+	tx_task_stack_init(&up->task, loop);
+	tx_task_stack_push(&up->task, do_channel_wrapper, up);
+
 	tx_timer_init(&up->on_dead, loop, &up->on_stop);
 	on_loop_cleanup(&up->on_stop);
 	up->is_mobile = 1;
@@ -765,7 +1050,7 @@ static void do_channel_prepare(struct channel_context *up, int newfd, unsigned s
 	tx_setblockopt(newfd, 0);
 
 	tx_aiocb_init(&up->remote, loop, -1);
-	tx_task_active(&up->task);
+	tx_task_stack_active(&up->task);
 
 	up->flags = 0;
 	up->c2r.flag = 0;
@@ -774,7 +1059,7 @@ static void do_channel_prepare(struct channel_context *up, int newfd, unsigned s
 	up->r2c.len = up->r2c.off = 0;
 	strcpy(up->domain, "HELO");
 
-	fprintf(stderr, "newfd: %d to here\n", newfd);
+	LOG_DEBUG("newfd: %d to here\n", newfd);
 	return;
 }
 
