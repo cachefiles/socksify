@@ -689,6 +689,7 @@ static void block_transfer(void *upp, tx_task_stack_t *sta)
 	int len;
 
 	_dbg_ctx = up;
+	tx_timer_reset(&up->on_dead, 300000);
 	LOG_VERBOSE("block_transfer enter: %p %d\n", upp, d->limit);
 	do {
 		change = fill_relay_data(&up->r2c, &up->remote);
@@ -768,6 +769,7 @@ static void chunk_transfer(void *upp, tx_task_stack_t *sta)
 	int change;
 
 	_dbg_ctx = up;
+	tx_timer_reset(&up->on_dead, 300000);
 	change = fill_relay_data(&up->r2c, &up->remote);
 	if (change & 0x02) goto exception;
 
@@ -809,6 +811,7 @@ static void https_proto_transfer(void *upp, tx_task_stack_t *sta)
 	int error = 0;
 	
 	_dbg_ctx = up;
+	tx_timer_reset(&up->on_dead, 300000);
 	LOG_DEBUG("https_proto_transfer enter: %p %s\n", up, up->domain);
 	do {
 		change = fill_relay_data(&up->r2c, &up->remote);
