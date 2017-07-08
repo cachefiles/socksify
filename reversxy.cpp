@@ -510,7 +510,6 @@ static int parse_http_target(struct relay_data *d, char *host, size_t len)
 	char uri[512], method[16], ver[16];
 	sscanf(d->buf, "%16s %511s %15s", method, uri, ver);
 
-	LOG_DEBUG("off: %d\n", d->off);
 	assert(d->off == 0);
 	if ((memmem(d->buf, d->len, "\r\n\r\n", 4) == NULL) &&
 			((memcmp(uri, "http://", 7) && memcmp(uri, "https://", 8)) || (memmem(d->buf, d->len, "\r\n", 2) == NULL))) {
@@ -757,7 +756,7 @@ int parse_http_chunk(struct channel_context *up, struct relay_data *r)
 
 	if (r->flag & RDF_EOF) {
 		LOG_ERROR("unexpected End of file\n");
-		assert(0);
+		// assert(0);
 	}
 
 	return -1;
@@ -779,9 +778,11 @@ static void chunk_transfer(void *upp, tx_task_stack_t *sta)
 		return;
 	}
 
-	if (0 == (up->r2c.flag & RDF_CHUNKED_EOF) && parse_http_chunk(up, &up->r2c) < 0) {
+	if (0 == (up->r2c.flag & RDF_CHUNKED_EOF)
+			&& parse_http_chunk(up, &up->r2c) < 0) {
 		int error = relay_fill_prepare(&up->r2c, &up->remote, &up->task);
-		assert (error != 0);
+		if (error == 0) goto exception;
+		assert(error != 0);
 		return;
 	}
 
@@ -922,7 +923,8 @@ static void http_proto_transfer(void *upp, tx_task_stack_t *sta)
 	if ((up->flags & HTTP_RESPONSE) == 0
 			&& parse_http_response(up, &up->r2c) < 0) {
 		int error = relay_fill_prepare(&up->r2c, &up->remote, &up->task);
-		assert (error != 0);
+		if (error == 0) goto exception;
+		assert(error != 0);
 		return;
 	}
 
