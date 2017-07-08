@@ -618,8 +618,8 @@ static int do_host_connect(tx_aiocb *s, char *domain, int port, tx_task_stack_t 
 	sin0.sin_family = AF_INET;
 	error = bind(peerfd, (struct sockaddr *)&sin0, sizeof(sin0));
 
-	tx_aiocb_fini(s);
 	closesocket(s->tx_fd);
+	tx_aiocb_fini(s);
 
 	tx_aiocb_init(s, loop, peerfd);
 
@@ -628,7 +628,7 @@ static int do_host_connect(tx_aiocb *s, char *domain, int port, tx_task_stack_t 
 	sin0.sin_addr.s_addr = (info.address);
 	error = tx_aiocb_connect(s, (struct sockaddr *)&sin0, sizeof(sin0), STACK2TASK(t));
 
-	LOG_WARNN("connect to %s: %x:%d %d\n", domain, info.address, htons(info.port), error);
+	LOG_WARNN("do_host_connect: connect to %s: %x:%d %d\n", domain, info.address, htons(info.port), error);
 	return error;
 }
 
@@ -637,6 +637,7 @@ static struct tcpip_info _remote_target = {0};
 static int parse_http_response(struct channel_context *up, struct relay_data *r)
 {
 	const char *ptr;
+	int temp_flags = 0;
 	const char content_length[] = "Content-Length:";
 	const char transfer_encoding[] = "Transfer-Encoding:";
 
@@ -660,12 +661,13 @@ static int parse_http_response(struct channel_context *up, struct relay_data *r)
 		LOG_VERBOSE("CL %s %s |%d\n", content_length, ptr, r->content_length);
 	} else {
 		r->content_length = 1000000;
-		up->flags |= CLOSE_PROTO;
+		temp_flags |= CLOSE_PROTO;
 	}
 
 	if ((ptr = strstr(r->buf, "\r\n\r\n")) != NULL) {
 		r->limit = (ptr + 4 - r->buf);
 		LOG_VERBOSE("parse_http_response: %p %x \n%.*s\n", up, r->flag, r->limit, r->buf);
+		up->flags |= temp_flags;
 		return 0;
 	}
 
@@ -686,10 +688,14 @@ static void block_transfer(void *upp, tx_task_stack_t *sta)
 	int change = 0;
 	int len;
 
+	_dbg_ctx = up;
 	LOG_VERBOSE("block_transfer enter: %p %d\n", upp, d->limit);
 	do {
 		change = fill_relay_data(&up->r2c, &up->remote);
-		if (change & 0x02) goto exception;
+		if (change & 0x02) {
+			LOG_VERBOSE("block_transfer write failure\n");
+			goto exception;
+		}
 
 		if (tx_writable(f) && d->off < d->len && d->limit) {
 			do {
@@ -703,6 +709,7 @@ static void block_transfer(void *upp, tx_task_stack_t *sta)
 					d->limit -= len;
 					d->stat_total += len;
 				} else if (tx_writable(f)) {
+					LOG_VERBOSE("block_transfer write failure\n");
 					goto exception;
 				}
 			} while (len > 0 && d->off < d->len && d->limit);
@@ -725,6 +732,7 @@ static void block_transfer(void *upp, tx_task_stack_t *sta)
 	return;
 
 exception:
+	LOG_DEBUG("block_transfer exception: %p %d\n", upp, d->limit);
 	up->flags |= UNKOWN_PROTO;
 	tx_task_stack_raise(sta);
 	return;
@@ -759,6 +767,7 @@ static void chunk_transfer(void *upp, tx_task_stack_t *sta)
 	struct channel_context *up = (struct channel_context *)upp;
 	int change;
 
+	_dbg_ctx = up;
 	change = fill_relay_data(&up->r2c, &up->remote);
 	if (change & 0x02) goto exception;
 
@@ -787,6 +796,7 @@ static void chunk_transfer(void *upp, tx_task_stack_t *sta)
 	return;
 
 exception:
+	LOG_DEBUG("chunk_transfer exception: %p\n", up);
 	up->flags |= UNKOWN_PROTO;
 	tx_task_stack_raise(sta);
 	return;
@@ -798,6 +808,7 @@ static void https_proto_transfer(void *upp, tx_task_stack_t *sta)
 	int change = 0;
 	int error = 0;
 	
+	_dbg_ctx = up;
 	LOG_DEBUG("https_proto_transfer enter: %p %s\n", up, up->domain);
 	do {
 		change = fill_relay_data(&up->r2c, &up->remote);
@@ -828,7 +839,7 @@ static void https_proto_transfer(void *upp, tx_task_stack_t *sta)
 	if (error) return;
 
 exception:
-	LOG_VERBOSE("http_proto_input exception\n");
+	LOG_DEBUG("https_proto_input exception\n");
 	up->flags |= UNKOWN_PROTO;
 	tx_task_stack_raise(sta);
 	return;
@@ -840,6 +851,7 @@ static void https_proto_input(void *upp, tx_task_stack_t *sta)
 	const char resp[] = "HTTP/1.0 200 OK\r\n\r\n";
 	struct channel_context *up = (struct channel_context *)upp;
 	
+	_dbg_ctx = up;
 	LOG_DEBUG("https_proto_input enter: %p %s\n", up, up->domain);
 	if (fill_relay_data(&up->c2r, &up->file) == 2) {
 		goto exception;
@@ -884,14 +896,21 @@ static void http_proto_transfer(void *upp, tx_task_stack_t *sta)
 	int change = 1;
 	struct channel_context *up = (struct channel_context *)upp;
 
+	_dbg_ctx = up;
 	LOG_VERBOSE("http_proto_transfer enter: %p %s\n", up, up->domain);
 	while ((change == 1) 
 			&& (up->flags & HTTP_REQUEST) == 0) {
 		change = fill_relay_data(&up->c2r, &up->file);
-		if (change & 0x02) goto exception;
+		if (change & 0x02) {
+			LOG_DEBUG("http_proto_transfer exception on read: %p %s\n", up, up->domain);
+			goto exception;
+		}
 
 		change |= write_relay_data(&up->c2r, &up->remote, up->is_mobile);
-		if (change & 0x02) goto exception;
+		if (change & 0x02) {
+			LOG_DEBUG("http_proto_transfer exception on write: %p %s\n", up, up->domain);
+			goto exception;
+		}
 	}
 
 	change = fill_relay_data(&up->r2c, &up->remote);
@@ -929,13 +948,17 @@ static void http_proto_transfer(void *upp, tx_task_stack_t *sta)
 	}
 
 	LOG_VERBOSE("http_proto_transfer full leave: %p %s\n", up, up->domain);
-	if (up->flags & CLOSE_PROTO) goto exception;
+	if (up->flags & CLOSE_PROTO) {
+		LOG_DEBUG("http_proto_transfer exception on proto close: %p %s\n", up, up->domain);
+		goto exception;
+	}
 
 	tx_task_stack_pop1(&up->task, 0);
 	tx_task_stack_active(&up->task);
 	return;
 
 exception:
+	LOG_DEBUG("http_proto_transfer exception: %p %s\n", up, up->domain);
 	up->flags |= UNKOWN_PROTO;
 	tx_task_stack_raise(sta);
 	return;
@@ -946,13 +969,19 @@ static void http_proto_input(void *upp, tx_task_stack_t *sta)
 	char target[128];
 	struct channel_context *up = (struct channel_context *)upp;
 	
+	_dbg_ctx = up;
 	LOG_DEBUG("http_proto_input enter: %p %s\n", up, up->domain);
 	if (fill_relay_data(&up->c2r, &up->file) == 2) {
+	    LOG_DEBUG("http_proto_input read exception: %p %s\n", up, up->domain);
 		goto exception;
 	}
 
 	if (parse_http_target(&up->c2r, target, sizeof(target)) == 1) {
-		if (up->c2r.flag & RDF_EOF) goto exception;
+		if (up->c2r.flag & RDF_EOF) {
+	    	LOG_DEBUG("http_proto_input EOF exception: %p %s\n", up, up->domain);
+			goto exception;
+		}
+
 		int error = relay_fill_prepare(&up->c2r, &up->file, &up->task);
 		assert (error != 0);
 		return;
@@ -967,9 +996,10 @@ static void http_proto_input(void *upp, tx_task_stack_t *sta)
 	tx_task_stack_push(&up->task, http_proto_transfer, up);
 	tx_task_stack_active(&up->task);
 
-	up->flags &= ~HTTP_REQUEST;
-	up->r2c.content_length = 0;
+	up->flags &= ~(HTTP_REQUEST| HTTP_RESPONSE);
+	up->r2c.flag = 0;
 	up->r2c.limit = 0;
+	up->r2c.content_length = 0;
 
 	return;
 
