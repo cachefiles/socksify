@@ -25,9 +25,9 @@
 #define STACK2TASK(s) (&(s)->tx_sched)
 
 #define LOG_ERROR(fmt, args...) fprintf(stderr, fmt, ##args)
-// #define LOG_WARNN(fmt, args...) fprintf(stderr, fmt, ##args)
-// #define LOG_DEBUG(fmt, args...) fprintf(stderr, fmt, ##args)
-// #define LOG_VERBOSE(fmt, args...) fprintf(stderr, fmt, ##args)
+#define LOG_WARNN(fmt, args...) fprintf(stderr, fmt, ##args)
+#define LOG_DEBUG(fmt, args...) fprintf(stderr, fmt, ##args)
+#define LOG_VERBOSE(fmt, args...) fprintf(stderr, fmt, ##args)
 
 #ifndef LOG_ERROR
 #define LOG_ERROR(fmt, args...)
@@ -299,7 +299,8 @@ int try_shutdown_relay(struct relay_data *d, tx_aiocb *f)
 		d->off = d->len = 0;
 
 		if (RDF_MASK(d->flag) == RDF_EOF && tx_writable(f)) {
-			shutdown(f->tx_fd, SD_BOTH);
+			LOG_DEBUG("shutdown\n");
+			shutdown(f->tx_fd, SHUT_WR);
 			d->flag |= RDF_FIN;
 		}
 	}
@@ -518,7 +519,7 @@ static int parse_http_target(struct relay_data *d, char *host, size_t len)
 	assert(d->off == 0);
 	if ((memmem(d->buf, d->len, "\r\n\r\n", 4) == NULL) &&
 			((memcmp(uri, "http://", 7) && memcmp(uri, "https://", 8)) || (memmem(d->buf, d->len, "\r\n", 2) == NULL))) {
-		LOG_VERBOSE("request not finish: ##|%s|## %d %s %s %s\n", d->buf, d->len, method, uri, ver);
+		// LOG_VERBOSE("request not finish: ##|%s|## %d %s %s %s\n", d->buf, d->len, method, uri, ver);
 		return 1;
 	}
 
@@ -628,8 +629,8 @@ static int do_host_connect(tx_aiocb *s, char *domain, int port, tx_task_stack_t 
 	sin0.sin_family = AF_INET;
 	error = bind(peerfd, (struct sockaddr *)&sin0, sizeof(sin0));
 
-	closesocket(s->tx_fd);
 	tx_aiocb_fini(s);
+	closesocket(s->tx_fd);
 
 	tx_aiocb_init(s, loop, peerfd);
 
@@ -648,6 +649,7 @@ static int parse_http_response(struct channel_context *up, struct relay_data *r)
 {
 	const char *ptr;
 	int temp_flags = 0;
+	const char connect_type[] = "Connection:";
 	const char content_type[] = "Content-Type:";
 	const char content_length[] = "Content-Length:";
 	const char transfer_encoding[] = "Transfer-Encoding:";
@@ -669,10 +671,19 @@ static int parse_http_response(struct channel_context *up, struct relay_data *r)
 
 		r->flag |= RDF_LENGTH;
 		r->content_length = atoi(ptr);
-		LOG_VERBOSE("CL %s %s |%d\n", content_length, ptr, r->content_length);
+		// LOG_VERBOSE("CL %s %s |%d\n", content_length, ptr, r->content_length);
 	} else {
 		r->content_length = 1000000;
 		temp_flags |= HTTP_SHUTDOWN;
+	}
+
+	if ((ptr = strstr(r->buf, connect_type)) != NULL) {
+		ptr += strlen(connect_type);
+		while (*ptr == ' ') ptr++;
+
+		if (strncmp(ptr, "close", 5) == 0) {
+			temp_flags |= HTTP_SHUTDOWN;
+		}
 	}
 
 	if ((ptr = strstr(r->buf, content_type)) != NULL) {
@@ -701,13 +712,13 @@ static int parse_http_response(struct channel_context *up, struct relay_data *r)
 
 	if ((ptr = strstr(r->buf, "\r\n\r\n")) != NULL) {
 		r->limit = (ptr + 4 - r->buf);
-		LOG_VERBOSE("parse_http_response: %p %x \n%.*s\n", up, r->flag, r->limit, r->buf);
+		// LOG_VERBOSE("parse_http_response: %p %x \n%.*s\n", up, r->flag, r->limit, r->buf);
 		up->flags |= temp_flags;
 		return 0;
 	}
 
 	if (r->flag & RDF_EOF) {
-		LOG_VERBOSE("unexpected End of file %d %d %s\n", r->off, r->len, r->buf);
+		LOG_VERBOSE("parse_http_response unexpected End of file %d %d %s\n", r->off, r->len, r->buf);
 		up->flags |= HTTP_SHUTDOWN;
 		return 1;
 	}
@@ -805,6 +816,7 @@ static void chunk_transfer(void *upp, tx_task_stack_t *sta)
 
 	_dbg_ctx = up;
 	tx_timer_reset(&up->on_dead, 300000);
+	LOG_VERBOSE("chunk_transfer enter: %p %s\n", up, up->domain);
 	change = fill_relay_data(&up->r2c, &up->remote);
 	if (change & 0x02) goto exception;
 
@@ -906,7 +918,7 @@ static void https_proto_input(void *upp, tx_task_stack_t *sta)
 
 	strcpy(up->domain, target);
 	if (do_host_connect(&up->remote, target, 80, &up->task) == -1) {
-		LOG_WARNN("http target: %s\n", target);
+		LOG_WARNN("https target: %s\n", target);
 		goto exception;
 	}
 
@@ -985,6 +997,13 @@ static void http_proto_transfer(void *upp, tx_task_stack_t *sta)
 			&& parse_http_response(up, &up->r2c) < 0) {
 		int error = relay_fill_prepare(&up->r2c, &up->remote, &up->task);
 		if (error == 0) goto exception;
+
+		error = relay_fill_prepare(&up->c2r, &up->file, &up->task);
+		if (error == 0) goto exception;
+		up->c2r.buf[up->c2r.len] = 0;
+
+		LOG_DEBUG("http_proto_transfer wait remote read: %p %s %s\n@ %d %d",
+				up, up->domain, up->c2r.buf, up->c2r.off, up->c2r.len);
 		assert(error != 0);
 		return;
 	}
@@ -1002,12 +1021,14 @@ static void http_proto_transfer(void *upp, tx_task_stack_t *sta)
 	up->flags |= HTTP_RESPONSE;
 	up->flags |= HTTP_REQUEST;
 
+	LOG_DEBUG("http_proto_transfer liit: %d\n", up->r2c.limit);
 	if (up->r2c.limit > 0) {
 		tx_task_stack_push(&up->task, block_transfer, up);
 		tx_task_stack_active(&up->task);
 		return;
 	}
 
+	LOG_DEBUG("http_proto_transfer conent: %d\n", up->r2c.content_length);
 	if (up->r2c.content_length > 0) {
 		up->r2c.limit = up->r2c.content_length;
 		up->r2c.content_length = 0;
@@ -1018,13 +1039,14 @@ static void http_proto_transfer(void *upp, tx_task_stack_t *sta)
 	}
 
 	if (up->r2c.flag & RDF_CHUNKED) {
+		LOG_DEBUG("http_proto_transfer chunk\n");
 		tx_task_stack_push(&up->task, chunk_transfer, up);
 		tx_task_stack_active(&up->task);
 		return;
 	}
 
 	LOG_VERBOSE("http_proto_transfer full leave: %p %s\n", up, up->domain);
-	if (up->flags & HTTP_REDIRECT) {
+	if (up->flags & HTTP_SHUTDOWN) {
 		LOG_DEBUG("http_proto_transfer exception on proto close: %p %s\n", up, up->domain);
 		goto exception;
 	}
@@ -1191,6 +1213,7 @@ static void do_listen_accepted(void *up)
 			return;
 		}
 
+		memset(cc0, 0, sizeof(*cc0));
 		do_channel_prepare(cc0, newfd, lp0->port);
 		if (lp0->just_forward) {
 			cc0->flags |= FORWARD_PROTO;
