@@ -25,8 +25,8 @@
 #define STACK2TASK(s) (&(s)->tx_sched)
 
 #define LOG_ERROR(fmt, args...) fprintf(stderr, fmt, ##args)
-#define LOG_WARNN(fmt, args...) fprintf(stderr, fmt, ##args)
-#define LOG_DEBUG(fmt, args...) fprintf(stderr, fmt, ##args)
+// #define LOG_WARNN(fmt, args...) fprintf(stderr, fmt, ##args)
+// #define LOG_DEBUG(fmt, args...) fprintf(stderr, fmt, ##args)
 // #define LOG_VERBOSE(fmt, args...) fprintf(stderr, fmt, ##args)
 
 #ifndef LOG_ERROR
@@ -320,6 +320,7 @@ struct channel_context {
 	int port;
 	in_addr target;
 	char domain[128];
+	char *url_access;
 	int (*proxy_handshake)(struct channel_context *up);
 
 	struct relay_data c2r;
@@ -338,7 +339,8 @@ int relay_fill_prepare(struct relay_data *d, tx_aiocb *f, tx_task_stack_t *t)
 		tx_aincb_active(f, &t->tx_sched);
 		error = 1;
 	} else {
-		printf("fallback %x %d %d: %s\n", d->flag, tx_readable(f), d->len, _dbg_ctx? _dbg_ctx->domain: "");
+		LOG_WARNN("fallback %x %d %d: %d %s\n",
+				d->flag, tx_readable(f), d->len, d->stat_total, _dbg_ctx? _dbg_ctx->domain: "");
 	}
 
 	return error;
@@ -372,7 +374,9 @@ enum {
 
 	HTTP_REQUEST = (1 << 8),
 	HTTP_RESPONSE = (1 << 9),
-	CLOSE_PROTO = (1 << 10),
+
+	HTTP_REDIRECT = (1 << 10),
+	HTTP_SHUTDOWN = (1 << 11),
 };
 
 static const int SUPPORTED_PROTO = UNKOWN_PROTO| SOCKV4_PROTO| SOCKV5_PROTO| HTTP_PROTO| HTTPS_PROTO| FORWARD_PROTO| DIRECT_PROTO ;
@@ -503,6 +507,7 @@ static int parse_https_target(struct relay_data *d, char *host, size_t len)
 }
 
 #define N 10
+static char *_url_location = NULL;
 
 static int parse_http_target(struct relay_data *d, char *host, size_t len)
 {
@@ -541,7 +546,7 @@ static int parse_http_target(struct relay_data *d, char *host, size_t len)
 		strncpy(host, delter, len -1);
 	}
 
-#if 0
+#if 1
 	p = (char *)memmem(d->buf, d->len, "\r\n", 2);
 	if (p != NULL) {
 		char *line_limit = p;
@@ -561,6 +566,12 @@ static int parse_http_target(struct relay_data *d, char *host, size_t len)
 		}
 	}
 #endif
+
+	if (*uri != 0) {
+		LOG_ERROR("http url: %s\n", uri);
+		if (_url_location) free(_url_location);
+		_url_location = strdup(uri);
+	}
 
 	return 0;
 }
@@ -637,6 +648,7 @@ static int parse_http_response(struct channel_context *up, struct relay_data *r)
 {
 	const char *ptr;
 	int temp_flags = 0;
+	const char content_type[] = "Content-Type:";
 	const char content_length[] = "Content-Length:";
 	const char transfer_encoding[] = "Transfer-Encoding:";
 
@@ -660,7 +672,31 @@ static int parse_http_response(struct channel_context *up, struct relay_data *r)
 		LOG_VERBOSE("CL %s %s |%d\n", content_length, ptr, r->content_length);
 	} else {
 		r->content_length = 1000000;
-		temp_flags |= CLOSE_PROTO;
+		temp_flags |= HTTP_SHUTDOWN;
+	}
+
+	if ((ptr = strstr(r->buf, content_type)) != NULL) {
+		ptr += strlen(content_type);
+		while (*ptr == ' ') ptr++;
+
+		char tmp[256];
+		const char *forbit_types[] = {
+			"video", "image", "application", NULL
+		};
+
+		sscanf(ptr, "%255s", tmp);
+		LOG_ERROR("Content-Type: %s Length: %d\n", tmp, r->content_length);
+
+		for (int i = 0; forbit_types[i]; i++) {
+			const char *type = forbit_types[i];
+			if (0 == strncmp(tmp, type, strlen(type))) {
+				if (r->content_length == 0 || 
+						r->content_length > 384 * 1024) {
+					temp_flags |= HTTP_REDIRECT;
+				}
+				break;
+			}
+		}
 	}
 
 	if ((ptr = strstr(r->buf, "\r\n\r\n")) != NULL) {
@@ -672,7 +708,7 @@ static int parse_http_response(struct channel_context *up, struct relay_data *r)
 
 	if (r->flag & RDF_EOF) {
 		LOG_VERBOSE("unexpected End of file %d %d %s\n", r->off, r->len, r->buf);
-		up->flags |= CLOSE_PROTO;
+		up->flags |= HTTP_SHUTDOWN;
 		return 1;
 	}
 
@@ -895,6 +931,31 @@ exception:
 	return;
 }
 
+/* https://web.jooyol.com/surfing/www.baidu.com/ */
+
+static const char http_redirect[] = {
+	"HTTP/1.0 302 Moved Temporarily\r\n"
+	"Server: Tengine/2.1.0\r\n"
+	"Content-Type: text/html\r\n"
+	"Location: https://web.jooyol.com/surfing/%s\r\n"
+	"\r\n"
+};
+
+static void fill_http_redirect(struct relay_data *d, channel_context *up)
+{
+	int count;
+	d->limit = 0;
+	d->off   = 0;
+
+	count = snprintf(d->buf, sizeof(d->buf), http_redirect, up->url_access? up->url_access + 7: "");
+	assert (count < sizeof(d->buf));
+
+	d->len   = count;
+	d->content_length = count;
+
+	return;
+}
+
 static void http_proto_transfer(void *upp, tx_task_stack_t *sta)
 {
 	int change = 1;
@@ -928,6 +989,16 @@ static void http_proto_transfer(void *upp, tx_task_stack_t *sta)
 		return;
 	}
 
+#if 1
+	if (up->flags & HTTP_REDIRECT) {
+		up->r2c.flag &= ~(RDF_CHUNKED| RDF_CHUNKED_EOF);
+		up->r2c.flag |= RDF_EOF;
+
+		up->flags &= ~HTTP_REDIRECT;
+		fill_http_redirect(&up->r2c, up);
+	}
+#endif
+
 	up->flags |= HTTP_RESPONSE;
 	up->flags |= HTTP_REQUEST;
 
@@ -953,7 +1024,7 @@ static void http_proto_transfer(void *upp, tx_task_stack_t *sta)
 	}
 
 	LOG_VERBOSE("http_proto_transfer full leave: %p %s\n", up, up->domain);
-	if (up->flags & CLOSE_PROTO) {
+	if (up->flags & HTTP_REDIRECT) {
 		LOG_DEBUG("http_proto_transfer exception on proto close: %p %s\n", up, up->domain);
 		goto exception;
 	}
@@ -1005,6 +1076,9 @@ static void http_proto_input(void *upp, tx_task_stack_t *sta)
 	up->r2c.flag = 0;
 	up->r2c.limit = 0;
 	up->r2c.content_length = 0;
+
+	up->url_access = _url_location;
+	_url_location = NULL;
 
 	return;
 
@@ -1106,7 +1180,7 @@ static void do_listen_accepted(void *up)
 	lp0 = (struct listen_context *)up;
 
 	int newfd = tx_listen_accept(&lp0->file, NULL, NULL);
-	TX_PRINT(TXL_DEBUG, "new fd: %d\n", newfd);
+	LOG_DEBUG("new fd: %d\n", newfd);
 	tx_listen_active(&lp0->file, &lp0->task);
 
 	if (newfd != -1) {
