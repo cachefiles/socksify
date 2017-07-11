@@ -949,6 +949,7 @@ static const char http_redirect[] = {
 	"HTTP/1.0 302 Moved Temporarily\r\n"
 	"Server: Tengine/2.1.0\r\n"
 	"Content-Type: text/html\r\n"
+	"Connection: close\r\n"
 	"Location: https://web.jooyol.com/surfing/%s\r\n"
 	"\r\n"
 };
@@ -1014,6 +1015,7 @@ static void http_proto_transfer(void *upp, tx_task_stack_t *sta)
 		up->r2c.flag |= RDF_EOF;
 
 		up->flags &= ~HTTP_REDIRECT;
+		up->flags |= HTTP_SHUTDOWN;
 		fill_http_redirect(&up->r2c, up);
 	}
 #endif
