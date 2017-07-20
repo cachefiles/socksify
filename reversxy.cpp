@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <regex.h>
+#include <time.h>
 #ifdef WIN32
 #include <windows.h>
 #else
@@ -99,13 +100,13 @@ static void wait_protected_socket(tx_task_t *task)
 	tx_loop_t *loop = tx_loop_default();
 
 	if (_protect_count > 0) {
-		tx_task_active(task);
+		tx_task_active(task, "protect");
 		return;
 	}
 
 	tx_task_record(&_protect_cond, task);
 	if (_protect_req == 0) {
-		tx_task_active(&_protect_task);
+		tx_task_active(&_protect_task, "protect");
 		tx_loop_break(loop);
 	}
 
@@ -125,7 +126,7 @@ void check_protect_socks(void *upp)
 
 	if (!tx_taskq_empty(&_protect_cond)
 			&& _protect_count < 1024) {
-		tx_task_active(&_protect_task);
+		tx_task_active(&_protect_task, "protect");
 		tx_loop_break(loop);
 	}
 
@@ -192,7 +193,7 @@ extern "C" int main_loop_cleanup(void)
 	}
 
 	tx_task_drop(&_protect_task);
-	tx_task_wakeup(&_stop_queue);
+	tx_task_wakeup(&_stop_queue, "cleanup");
 	tx_loop_break(loop);
 
 	if (!tx_taskq_empty(&_protect_cond)) {
@@ -241,7 +242,7 @@ extern "C" void add_protect_socket(int newfd)
 	if (newfd >= 0) {
 		_protect_socks[_protect_count++] = newfd;
 		if (_protect_req > 0) _protect_req--;
-		tx_task_wakeup(&_protect_cond);
+		tx_task_wakeup(&_protect_cond, "add protect socket");
 	}
 
 	return;
@@ -324,6 +325,7 @@ struct channel_context {
 	char *url_access;
 	int (*proxy_handshake)(struct channel_context *up);
 
+	time_t ctime;
 	struct relay_data c2r;
 	struct relay_data r2c;
 };
@@ -342,6 +344,7 @@ int relay_fill_prepare(struct relay_data *d, tx_aiocb *f, tx_task_stack_t *t)
 	} else {
 		LOG_WARNN("fallback %x %d %d: %d %s\n",
 				d->flag, tx_readable(f), d->len, d->stat_total, _dbg_ctx? _dbg_ctx->domain: "");
+
 	}
 
 	return error;
@@ -774,14 +777,14 @@ static void block_transfer(void *upp, tx_task_stack_t *sta)
 
 	LOG_VERBOSE("block_transfer full leave: %p %d\n", upp, d->limit);
 	tx_task_stack_pop1(&up->task, 0);
-	tx_task_stack_active(&up->task);
+	tx_task_stack_active(&up->task, "block_transfer");
 	d->limit = 0;
 	return;
 
 exception:
 	LOG_DEBUG("block_transfer exception: %p %d\n", upp, d->limit);
 	up->flags |= UNKOWN_PROTO;
-	tx_task_stack_raise(sta);
+	tx_task_stack_raise(sta, "exception");
 	return;
 }
 
@@ -822,7 +825,7 @@ static void chunk_transfer(void *upp, tx_task_stack_t *sta)
 
 	if (up->r2c.limit > 0) {
 		tx_task_stack_push(&up->task, block_transfer, up);
-		tx_task_stack_active(&up->task);
+		tx_task_stack_active(&up->task, "block_transfer");
 		return;
 	}
 
@@ -836,12 +839,12 @@ static void chunk_transfer(void *upp, tx_task_stack_t *sta)
 
 	if (up->r2c.limit > 0) {
 		tx_task_stack_push(&up->task, block_transfer, up);
-		tx_task_stack_active(&up->task);
+		tx_task_stack_active(&up->task, "chunk_transfer");
 		return;
 	}
 
 	tx_task_stack_pop1(&up->task, 0);
-	tx_task_stack_active(&up->task);
+	tx_task_stack_active(&up->task, "chunk_transfer");
 	up->r2c.flag &= ~RDF_CHUNKED_EOF;
 	up->r2c.flag &= ~RDF_CHUNKED;
 	return;
@@ -849,7 +852,7 @@ static void chunk_transfer(void *upp, tx_task_stack_t *sta)
 exception:
 	LOG_DEBUG("chunk_transfer exception: %p\n", up);
 	up->flags |= UNKOWN_PROTO;
-	tx_task_stack_raise(sta);
+	tx_task_stack_raise(sta, "exception");
 	return;
 }
 
@@ -893,7 +896,7 @@ static void https_proto_transfer(void *upp, tx_task_stack_t *sta)
 exception:
 	LOG_DEBUG("https_proto_input exception\n");
 	up->flags |= UNKOWN_PROTO;
-	tx_task_stack_raise(sta);
+	tx_task_stack_raise(sta, "exception");
 	return;
 }
 
@@ -928,7 +931,7 @@ static void https_proto_input(void *upp, tx_task_stack_t *sta)
 	up->c2r.off = 0;
 
 	tx_task_stack_push(&up->task, https_proto_transfer, up);
-	tx_task_stack_active(&up->task);
+	tx_task_stack_active(&up->task, "https_proto_input");
 
 	up->flags &= ~HTTP_REQUEST;
 	up->r2c.content_length = 0;
@@ -939,7 +942,7 @@ static void https_proto_input(void *upp, tx_task_stack_t *sta)
 exception:
 	LOG_VERBOSE("https_proto_input exception\n");
 	up->flags |= UNKOWN_PROTO;
-	tx_task_stack_raise(sta);
+	tx_task_stack_raise(sta, "exception");
 	return;
 }
 
@@ -1026,7 +1029,7 @@ static void http_proto_transfer(void *upp, tx_task_stack_t *sta)
 	LOG_DEBUG("http_proto_transfer liit: %d\n", up->r2c.limit);
 	if (up->r2c.limit > 0) {
 		tx_task_stack_push(&up->task, block_transfer, up);
-		tx_task_stack_active(&up->task);
+		tx_task_stack_active(&up->task, "http_proto_input");
 		return;
 	}
 
@@ -1036,14 +1039,14 @@ static void http_proto_transfer(void *upp, tx_task_stack_t *sta)
 		up->r2c.content_length = 0;
 
 		tx_task_stack_push(&up->task, block_transfer, up);
-		tx_task_stack_active(&up->task);
+		tx_task_stack_active(&up->task, "http_proto_input");
 		return;
 	}
 
 	if (up->r2c.flag & RDF_CHUNKED) {
 		LOG_DEBUG("http_proto_transfer chunk\n");
 		tx_task_stack_push(&up->task, chunk_transfer, up);
-		tx_task_stack_active(&up->task);
+		tx_task_stack_active(&up->task, "http_proto_input");
 		return;
 	}
 
@@ -1054,13 +1057,13 @@ static void http_proto_transfer(void *upp, tx_task_stack_t *sta)
 	}
 
 	tx_task_stack_pop1(&up->task, 0);
-	tx_task_stack_active(&up->task);
+	tx_task_stack_active(&up->task, "http_proto_input");
 	return;
 
 exception:
 	LOG_DEBUG("http_proto_transfer exception: %p %s\n", up, up->domain);
 	up->flags |= UNKOWN_PROTO;
-	tx_task_stack_raise(sta);
+	tx_task_stack_raise(sta, "exception");
 	return;
 }
 
@@ -1094,7 +1097,7 @@ static void http_proto_input(void *upp, tx_task_stack_t *sta)
 	}
 
 	tx_task_stack_push(&up->task, http_proto_transfer, up);
-	tx_task_stack_active(&up->task);
+	tx_task_stack_active(&up->task, "http_proto_input");
 
 	up->flags &= ~(HTTP_REQUEST| HTTP_RESPONSE);
 	up->r2c.flag = 0;
@@ -1109,7 +1112,7 @@ static void http_proto_input(void *upp, tx_task_stack_t *sta)
 exception:
 	LOG_VERBOSE("http_proto_input exception\n");
 	up->flags |= UNKOWN_PROTO;
-	tx_task_stack_raise(sta);
+	tx_task_stack_raise(sta, "exception");
 	return;
 }
 
@@ -1130,13 +1133,13 @@ static int do_channel_poll(struct channel_context *up)
 
 	if (up->flags & HTTP_PROTO) {
 		tx_task_stack_push(&up->task, http_proto_input, up);
-		tx_task_stack_active(&up->task);
+		tx_task_stack_active(&up->task, "do_channel_poll");
 		return 1;
 	}
 
 	if (up->flags & HTTPS_PROTO) {
 		tx_task_stack_push(&up->task, https_proto_input, up);
-		tx_task_stack_active(&up->task);
+		tx_task_stack_active(&up->task, "do_channel_poll");
 		return 1;
 	}
 
@@ -1154,8 +1157,13 @@ static void do_channel_wrapper(void *up, tx_task_stack_t *sta)
 
 	_dbg_ctx = 0;
 	if (err == 0) {
-		LOG_DEBUG("channel release %p/%d %d %d\n",
-				upp, _connect_total, upp->c2r.stat_total, upp->r2c.stat_total);
+		LOG_DEBUG("channel release %p/%d %d %d %d %d\n",
+				upp, _connect_total, upp->c2r.stat_total, upp->r2c.stat_total, upp->ctime, time(NULL));
+
+		static char buf[10];
+		if (upp->c2r.stat_total == 0 && upp->c2r.len == 0 && upp->r2c.stat_total == 0)
+			LOG_WARNN("test: %d\n", read(upp->file.tx_fd, buf, sizeof(buf)));
+
 		do_channel_release(upp);
 		return;
 	}
@@ -1183,7 +1191,7 @@ static void do_channel_prepare(struct channel_context *up, int newfd, unsigned s
 	tx_setblockopt(newfd, 0);
 
 	tx_aiocb_init(&up->remote, loop, -1);
-	tx_task_stack_active(&up->task);
+	tx_task_stack_active(&up->task, "accept");
 
 	up->flags = 0;
 	up->c2r.flag = 0;
@@ -1216,6 +1224,7 @@ static void do_listen_accepted(void *up)
 		}
 
 		memset(cc0, 0, sizeof(*cc0));
+		cc0->ctime = time(NULL);
 		do_channel_prepare(cc0, newfd, lp0->port);
 		if (lp0->just_forward) {
 			cc0->flags |= FORWARD_PROTO;
