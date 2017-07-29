@@ -28,7 +28,7 @@
 #define LOG_ERROR(fmt, args...) fprintf(stderr, fmt, ##args)
 #define LOG_WARNN(fmt, args...) fprintf(stderr, fmt, ##args)
 #define LOG_DEBUG(fmt, args...) fprintf(stderr, fmt, ##args)
-#define LOG_VERBOSE(fmt, args...) fprintf(stderr, fmt, ##args)
+// #define LOG_VERBOSE(fmt, args...) fprintf(stderr, fmt, ##args)
 
 #ifndef LOG_ERROR
 #define LOG_ERROR(fmt, args...)
@@ -300,7 +300,7 @@ int try_shutdown_relay(struct relay_data *d, tx_aiocb *f)
 		d->off = d->len = 0;
 
 		if (RDF_MASK(d->flag) == RDF_EOF && tx_writable(f)) {
-			LOG_DEBUG("shutdown\n");
+			LOG_DEBUG("%p shutdown\n", f);
 			shutdown(f->tx_fd, SHUT_WR);
 			d->flag |= RDF_FIN;
 		}
@@ -339,7 +339,7 @@ int relay_fill_prepare(struct relay_data *d, tx_aiocb *f, tx_task_stack_t *t)
 
 	if ((flags == 0) && !tx_readable(f) &&
 			d->len < (int)sizeof(d->buf)) {
-		tx_aincb_active(f, &t->tx_sched);
+		tx_aincb_active(f, STACK2TASK(t));
 		error = 1;
 	} else {
 		LOG_WARNN("fallback %x %d %d: %d %s\n",
@@ -572,7 +572,7 @@ static int parse_http_target(struct relay_data *d, char *host, size_t len)
 #endif
 
 	if (*uri != 0) {
-		LOG_ERROR("http url: %s\n", uri);
+		LOG_DEBUG("http url: %s\n", uri);
 		if (_url_location) free(_url_location);
 		_url_location = strdup(uri);
 	}
@@ -699,7 +699,7 @@ static int parse_http_response(struct channel_context *up, struct relay_data *r)
 		};
 
 		sscanf(ptr, "%255s", tmp);
-		LOG_ERROR("Content-Type: %s Length: %d\n", tmp, r->content_length);
+		LOG_DEBUG("Content-Type: %s Length: %d\n", tmp, r->content_length);
 
 		for (int i = 0; forbit_types[i]; i++) {
 			const char *type = forbit_types[i];
@@ -728,6 +728,66 @@ static int parse_http_response(struct channel_context *up, struct relay_data *r)
 
 	return -1;
 }
+
+static void block_transfer_1(void *upp, tx_task_stack_t *sta)
+{
+	struct channel_context *up = (struct channel_context *)upp;
+	struct relay_data *d = &up->c2r;
+	tx_aiocb *f = &up->remote;
+	int change = 0;
+	int len;
+
+	_dbg_ctx = up;
+	tx_timer_reset(&up->on_dead, 300000);
+	LOG_VERBOSE("block_transfer_1 enter: %p %d\n", upp, d->limit);
+	do {
+		change = fill_relay_data(&up->c2r, &up->file);
+		if (change & 0x02) {
+			LOG_VERBOSE("block_transfer_1 write failure\n");
+			goto exception;
+		}
+
+		if (tx_writable(f) && d->off < d->len && d->limit) {
+			do {
+				int limit = d->len - d->off;
+				if (limit > d->limit) limit = d->limit;
+
+				len = tx_outcb_write(f, d->buf + d->off, limit);
+				if (len > 0) {
+					change |= (len > 0);
+					d->off += len;
+					d->limit -= len;
+					d->stat_total += len;
+				} else if (tx_writable(f)) {
+					LOG_VERBOSE("block_transfer_1 write failure\n");
+					goto exception;
+				}
+			} while (len > 0 && d->off < d->len && d->limit);
+		}
+
+	} while (change);
+
+	LOG_VERBOSE("block_transfer_1 fast leave: %d %d %d %d\n", d->limit, d->off, d->len, change);
+	if (d->limit > 0 && !(up->c2r.flag & RDF_EOF)) {
+		int error = relay_fill_prepare(&up->c2r, &up->file, &up->task);
+		error |= relay_write_prepare(&up->c2r, &up->remote, &up->task);
+		assert (error != 0);
+		return;
+	}
+
+	LOG_VERBOSE("block_transfer_1 full leave: %p %d\n", upp, d->limit);
+	tx_task_stack_pop1(&up->task, 0);
+	tx_task_stack_active(&up->task, "block_transfer");
+	d->limit = 0;
+	return;
+
+exception:
+	LOG_DEBUG("block_transfer_1 exception: %p %d\n", upp, d->limit);
+	up->flags |= UNKOWN_PROTO;
+	tx_task_stack_raise(sta, "exception");
+	return;
+}
+
 
 static void block_transfer(void *upp, tx_task_stack_t *sta)
 {
@@ -786,6 +846,22 @@ exception:
 	up->flags |= UNKOWN_PROTO;
 	tx_task_stack_raise(sta, "exception");
 	return;
+}
+
+static int get_tls_len(struct relay_data *r)
+{
+	int len;
+	unsigned char *next;
+	unsigned char *buf = (unsigned char *)(r->buf + r->off);
+	unsigned char *limit = (unsigned char *)(r->buf + r->len);
+
+	for (next = buf; next + 5 <= limit; next += 5) {
+		next += ((next[3] << 8) | next[4]);
+		LOG_VERBOSE("get_tls_len: %d %02x%02x %x\n", next + 5 - buf, next[1], next[2], next[0]);
+	}
+
+	LOG_VERBOSE("get_tls_len: %d\n", next - buf);
+	return next - buf;
 }
 
 int parse_http_chunk(struct channel_context *up, struct relay_data *r)
@@ -851,6 +927,50 @@ static void chunk_transfer(void *upp, tx_task_stack_t *sta)
 
 exception:
 	LOG_DEBUG("chunk_transfer exception: %p\n", up);
+	up->flags |= UNKOWN_PROTO;
+	tx_task_stack_raise(sta, "exception");
+	return;
+}
+
+static void https_tls_transfer(void *upp, tx_task_stack_t *sta)
+{
+	struct channel_context *up = (struct channel_context *)upp;
+	int change = 0;
+	int error = 0;
+
+	_dbg_ctx = up;
+	if (up->flags & HTTP_RESPONSE) {
+		up->r2c.limit = up->r2c.len;
+		up->flags &= ~HTTP_RESPONSE;
+		tx_task_stack_push(&up->task, block_transfer, up);
+		tx_task_stack_active(&up->task, "http_proto_input");
+		return;
+	}
+
+	change = fill_relay_data(&up->c2r, &up->file);
+	if (change & 0x02) goto exception;
+	if (up->c2r.len >= 5 + up->c2r.off) {
+		up->c2r.limit = get_tls_len(&up->c2r);
+		tx_task_stack_push(&up->task, block_transfer_1, up);
+		tx_task_stack_active(&up->task, "http_proto_input");
+		return;
+	}
+
+	change = fill_relay_data(&up->r2c, &up->remote);
+	if (change & 0x02) goto exception;
+	if (up->r2c.len >= 5 + up->r2c.off) {
+		up->r2c.limit = get_tls_len(&up->r2c);
+		tx_task_stack_push(&up->task, block_transfer, up);
+		tx_task_stack_active(&up->task, "http_proto_input");
+		return;
+	}
+
+	error  = relay_fill_prepare(&up->c2r, &up->file, &up->task);
+	error |= relay_fill_prepare(&up->r2c, &up->remote, &up->task);
+	if (error) return;
+
+exception:
+	LOG_DEBUG("https_tls_input exception\n");
 	up->flags |= UNKOWN_PROTO;
 	tx_task_stack_raise(sta, "exception");
 	return;
@@ -930,9 +1050,10 @@ static void https_proto_input(void *upp, tx_task_stack_t *sta)
 	up->c2r.len = 0;
 	up->c2r.off = 0;
 
-	tx_task_stack_push(&up->task, https_proto_transfer, up);
+	tx_task_stack_push(&up->task, https_tls_transfer, up);
 	tx_task_stack_active(&up->task, "https_proto_input");
 
+	up->flags |= HTTP_RESPONSE;
 	up->flags &= ~HTTP_REQUEST;
 	up->r2c.content_length = 0;
 	up->r2c.limit = 0;
